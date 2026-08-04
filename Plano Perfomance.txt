@@ -1,0 +1,21 @@
+############################################################
+# Plano de Energia - Ultimate Performance
+############################################################
+
+Write-Host "Configurando plano de energia..." -ForegroundColor Cyan
+
+# GUID do Ultimate Performance
+$UltimateGUID = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+
+# Verifica se o plano já existe
+$ExistingPlan = (powercfg /L | Select-String $UltimateGUID)
+
+if (-not $ExistingPlan) {
+    Write-Host "Criando plano Ultimate Performance..."
+    powercfg -duplicatescheme $UltimateGUID | Out-Null
+}
+
+# Ativa o plano
+powercfg /S $UltimateGUID
+
+Write-Host "Plano Ultimate Performance ativado com sucesso!" -ForegroundColor Green
