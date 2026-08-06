@@ -1,0 +1,54 @@
+# Fecha aplicações do Office
+$processes = @(
+    "WINWORD","EXCEL","POWERPNT","OUTLOOK",
+    "ONENOTE","MSACCESS","Teams","OneDrive"
+)
+
+foreach ($proc in $processes) {
+    Get-Process -Name $proc -ErrorAction SilentlyContinue | Stop-Process -Force
+}
+
+Write-Host "Removendo credenciais do Office..."
+
+# Remove credenciais relacionadas ao Office/Microsoft
+$targets = cmdkey /list | Select-String "Target:"
+
+foreach ($target in $targets) {
+    $name = $target.ToString().Replace("Target: ","").Trim()
+
+    if ($name -match "MicrosoftOffice|Office|ADAL|OneDrive|Teams|Outlook|msteams|MicrosoftAccount|login.microsoftonline|AzureAD") {
+        Write-Host "Removendo: $name"
+        cmdkey /delete:$name | Out-Null
+    }
+}
+
+# Remove cache do Identity Broker (WAM)
+$wam = "$env:LOCALAPPDATA\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy"
+
+if (Test-Path $wam) {
+    Write-Host "Limpando cache WAM..."
+    Remove-Item "$wam\AC\TokenBroker" -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Remove tokens do IdentityCache
+$identity = "$env:LOCALAPPDATA\Microsoft\IdentityCache"
+
+if (Test-Path $identity) {
+    Write-Host "Removendo IdentityCache..."
+    Remove-Item $identity -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Remove cache do Office
+$officeCache = "$env:LOCALAPPDATA\Microsoft\Office"
+
+if (Test-Path $officeCache) {
+    Get-ChildItem $officeCache -Directory |
+        Where-Object { $_.Name -match "16\.0|15\.0" } |
+        ForEach-Object {
+            Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+}
+
+Write-Host ""
+Write-Host "Concluído."
+Write-Host "Reinicie o computador e autentique-se novamente no Microsoft 365."
