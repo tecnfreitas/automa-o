@@ -1,0 +1,6 @@
+Use este comando:
+
+Get-Process |
+Sort-Object WorkingSet64 -Descending |
+Select-Object -First 10 Name,Id,
+@{Name="MemoryMB";Expression={[math]::Round($_.WorkingSet64/1MB,2)}}
