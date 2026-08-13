@@ -1,0 +1,530 @@
+<#
+.SYNOPSIS
+    Disk Space Investigator
+
+.DESCRIPTION
+    Analisa o consumo de espaço em disco e identifica:
+      - Usuário que mais ocupa espaço
+      - Pastas que mais consomem espaço
+      - Arquivos temporários
+      - Arquivos muito grandes
+      - Arquivos antigos
+      - Percentual de utilização do disco
+      - Status OK / WARNING / CRITICAL
+      - Exportação para CSV
+      - Relatório HTML
+
+.NOTES
+    Execute preferencialmente como Administrador.
+#>
+
+# ==============================
+# CONFIGURAÇÃO
+# ==============================
+
+$Drive = "C:\"
+$OutputPath = "$env:USERPROFILE\Desktop\DiskSpaceReport"
+
+# Limites
+$WarningPercent  = 80
+$CriticalPercent = 90
+
+# Arquivo grande
+$LargeFileGB = 1
+
+# Arquivo antigo
+$OldFileDays = 180
+
+# ==============================
+# PREPARAÇÃO
+# ==============================
+
+New-Item -ItemType Directory -Path $OutputPath -Force |
+    Out-Null
+
+$ComputerName = $env:COMPUTERNAME
+$Date = Get-Date
+
+Write-Host ""
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host "       DISK SPACE INVESTIGATOR" -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host ""
+
+# ==============================
+# INFORMAÇÕES DO DISCO
+# ==============================
+
+$Disk = Get-CimInstance Win32_LogicalDisk `
+    -Filter "DeviceID='C:'"
+
+$TotalGB = [math]::Round($Disk.Size / 1GB, 2)
+$FreeGB  = [math]::Round($Disk.FreeSpace / 1GB, 2)
+
+$UsedGB = [math]::Round(
+    ($Disk.Size - $Disk.FreeSpace) / 1GB,
+    2
+)
+
+$UsedPercent = [math]::Round(
+    (($Disk.Size - $Disk.FreeSpace) / $Disk.Size) * 100,
+    2
+)
+
+# ==============================
+# STATUS
+# ==============================
+
+if ($UsedPercent -ge $CriticalPercent) {
+
+    $Status = "CRITICAL"
+    $Color = "Red"
+
+}
+elseif ($UsedPercent -ge $WarningPercent) {
+
+    $Status = "WARNING"
+    $Color = "Yellow"
+
+}
+else {
+
+    $Status = "OK"
+    $Color = "Green"
+}
+
+Write-Host "Computador : $ComputerName"
+Write-Host "Unidade    : $Drive"
+Write-Host "Total      : $TotalGB GB"
+Write-Host "Usado      : $UsedGB GB"
+Write-Host "Livre      : $FreeGB GB"
+Write-Host "Utilização : $UsedPercent%"
+Write-Host "Status     : $Status" -ForegroundColor $Color
+Write-Host ""
+
+# ==============================
+# SCAN DE ARQUIVOS
+# ==============================
+
+Write-Host "[+] Analisando arquivos..." -ForegroundColor Cyan
+
+$Files = Get-ChildItem `
+    -Path $Drive `
+    -File `
+    -Recurse `
+    -Force `
+    -ErrorAction SilentlyContinue
+
+Write-Host "[+] Arquivos encontrados: $($Files.Count)" `
+    -ForegroundColor Green
+
+# ==============================
+# USUÁRIOS
+# ==============================
+
+Write-Host ""
+Write-Host "[+] Calculando consumo por usuário..." `
+    -ForegroundColor Cyan
+
+$UserFolders = Get-ChildItem `
+    "C:\Users" `
+    -Directory `
+    -Force `
+    -ErrorAction SilentlyContinue
+
+$UserReport = foreach ($User in $UserFolders) {
+
+    $UserFiles = $Files |
+        Where-Object {
+            $_.FullName.StartsWith(
+                $User.FullName,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        }
+
+    $Size = ($UserFiles |
+        Measure-Object Length -Sum).Sum
+
+    [PSCustomObject]@{
+        User   = $User.Name
+        Folder = $User.FullName
+        SizeGB = [math]::Round($Size / 1GB, 2)
+    }
+}
+
+$UserReport = $UserReport |
+    Sort-Object SizeGB -Descending
+
+$TopUser = $UserReport | Select-Object -First 1
+
+Write-Host ""
+Write-Host "👤 Maior consumidor:" -ForegroundColor Yellow
+
+if ($TopUser) {
+
+    Write-Host "$($TopUser.User) → $($TopUser.SizeGB) GB" `
+        -ForegroundColor Yellow
+}
+
+# ==============================
+# PASTAS
+# ==============================
+
+Write-Host ""
+Write-Host "[+] Calculando principais pastas..." `
+    -ForegroundColor Cyan
+
+$FolderReport = Get-ChildItem `
+    $Drive `
+    -Directory `
+    -Force `
+    -ErrorAction SilentlyContinue |
+ForEach-Object {
+
+    $Folder = $_
+
+    $FolderFiles = $Files |
+        Where-Object {
+            $_.FullName.StartsWith(
+                $Folder.FullName,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        }
+
+    $Size = ($FolderFiles |
+        Measure-Object Length -Sum).Sum
+
+    [PSCustomObject]@{
+        Folder = $Folder.FullName
+        SizeGB = [math]::Round($Size / 1GB, 2)
+    }
+
+} |
+Sort-Object SizeGB -Descending
+
+# ==============================
+# ARQUIVOS GRANDES
+# ==============================
+
+Write-Host ""
+Write-Host "[+] Procurando arquivos grandes..." `
+    -ForegroundColor Cyan
+
+$LargeFiles = $Files |
+    Where-Object {
+        $_.Length -ge ($LargeFileGB * 1GB)
+    } |
+    Sort-Object Length -Descending |
+    Select-Object -First 100 |
+    Select-Object `
+        FullName,
+        LastWriteTime,
+        @{Name="SizeGB";Expression={
+            [math]::Round($_.Length / 1GB, 2)
+        }}
+
+# ==============================
+# ARQUIVOS ANTIGOS
+# ==============================
+
+Write-Host ""
+Write-Host "[+] Procurando arquivos antigos..." `
+    -ForegroundColor Cyan
+
+$OldDate = (Get-Date).AddDays(-$OldFileDays)
+
+$OldFiles = $Files |
+    Where-Object {
+        $_.LastWriteTime -lt $OldDate
+    } |
+    Sort-Object LastWriteTime |
+    Select-Object -First 100 |
+    Select-Object `
+        FullName,
+        LastWriteTime,
+        @{Name="AgeDays";Expression={
+            ((Get-Date) - $_.LastWriteTime).Days
+        }},
+        @{Name="SizeGB";Expression={
+            [math]::Round($_.Length / 1GB, 2)
+        }}
+
+# ==============================
+# ARQUIVOS TEMPORÁRIOS
+# ==============================
+
+Write-Host ""
+Write-Host "[+] Procurando arquivos temporários..." `
+    -ForegroundColor Cyan
+
+$TempPaths = @(
+    $env:TEMP
+    "$env:WINDIR\Temp"
+)
+
+$TempFiles = foreach ($TempPath in $TempPaths) {
+
+    if (Test-Path $TempPath) {
+
+        Get-ChildItem `
+            $TempPath `
+            -File `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+}
+
+$TempReport = $TempFiles |
+    Select-Object `
+        FullName,
+        LastWriteTime,
+        @{Name="SizeMB";Expression={
+            [math]::Round($_.Length / 1MB, 2)
+        }} |
+    Sort-Object SizeMB -Descending
+
+# ==============================
+# EXPORTAÇÃO CSV
+# ==============================
+
+Write-Host ""
+Write-Host "[+] Exportando relatórios CSV..." `
+    -ForegroundColor Cyan
+
+$UserReport |
+    Export-Csv `
+        "$OutputPath\Users.csv" `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+$FolderReport |
+    Export-Csv `
+        "$OutputPath\Folders.csv" `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+$LargeFiles |
+    Export-Csv `
+        "$OutputPath\LargeFiles.csv" `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+$OldFiles |
+    Export-Csv `
+        "$OutputPath\OldFiles.csv" `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+$TempReport |
+    Export-Csv `
+        "$OutputPath\TemporaryFiles.csv" `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+# ==============================
+# RELATÓRIO HTML
+# ==============================
+
+Write-Host ""
+Write-Host "[+] Gerando relatório HTML..." `
+    -ForegroundColor Cyan
+
+$Html = @"
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<title>Disk Space Investigator</title>
+
+<style>
+
+body {
+    font-family: Arial;
+    background: #f4f6f8;
+    color: #222;
+    margin: 40px;
+}
+
+h1 {
+    color: #1f2937;
+}
+
+.card {
+    background: white;
+    padding: 20px;
+    margin-bottom: 20px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.08);
+}
+
+.ok {
+    color: green;
+    font-weight: bold;
+}
+
+.warning {
+    color: #d97706;
+    font-weight: bold;
+}
+
+.critical {
+    color: red;
+    font-weight: bold;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th {
+    background: #1f2937;
+    color: white;
+    padding: 10px;
+    text-align: left;
+}
+
+td {
+    padding: 8px;
+    border-bottom: 1px solid #ddd;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>💾 Disk Space Investigator</h1>
+
+<div class="card">
+
+<h2>Resumo</h2>
+
+<p><b>Computador:</b> $ComputerName</p>
+
+<p><b>Data:</b> $Date</p>
+
+<p><b>Unidade:</b> $Drive</p>
+
+<p><b>Total:</b> $TotalGB GB</p>
+
+<p><b>Usado:</b> $UsedGB GB</p>
+
+<p><b>Livre:</b> $FreeGB GB</p>
+
+<p>
+<b>Utilização:</b>
+$UsedPercent%
+</p>
+
+<p class="$Status.ToLower()">
+Status: $Status
+</p>
+
+</div>
+
+<div class="card">
+
+<h2>👤 Usuários que mais consomem espaço</h2>
+
+$(
+    $UserReport |
+    Select-Object -First 10 |
+    ConvertTo-Html -Fragment
+)
+
+</div>
+
+<div class="card">
+
+<h2>📁 Principais pastas</h2>
+
+$(
+    $FolderReport |
+    Select-Object -First 20 |
+    ConvertTo-Html -Fragment
+)
+
+</div>
+
+<div class="card">
+
+<h2>📦 Arquivos grandes</h2>
+
+$(
+    $LargeFiles |
+    Select-Object -First 20 |
+    ConvertTo-Html -Fragment
+)
+
+</div>
+
+<div class="card">
+
+<h2>🕐 Arquivos antigos</h2>
+
+$(
+    $OldFiles |
+    Select-Object -First 20 |
+    ConvertTo-Html -Fragment
+)
+
+</div>
+
+<div class="card">
+
+<h2>🗑️ Arquivos temporários</h2>
+
+$(
+    $TempReport |
+    Select-Object -First 20 |
+    ConvertTo-Html -Fragment
+)
+
+</div>
+
+</body>
+
+</html>
+"@
+
+$Html |
+    Out-File `
+        "$OutputPath\DiskSpaceReport.html" `
+        -Encoding UTF8
+
+# ==============================
+# FINAL
+# ==============================
+
+Write-Host ""
+Write-Host "============================================" `
+    -ForegroundColor Cyan
+
+Write-Host "             ANÁLISE CONCLUÍDA" `
+    -ForegroundColor Green
+
+Write-Host "============================================" `
+    -ForegroundColor Cyan
+
+Write-Host ""
+
+Write-Host "Relatórios disponíveis em:" `
+    -ForegroundColor Yellow
+
+Write-Host $OutputPath
+
+Write-Host ""
+
+Write-Host "HTML:" `
+    -ForegroundColor Green
+
+Write-Host "$OutputPath\DiskSpaceReport.html"
+
+Write-Host ""
