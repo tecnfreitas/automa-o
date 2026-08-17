@@ -1,0 +1,294 @@
+# ============================================================
+# CORREÇÃO DO MICROSOFT TEAMS - EDGE WEBVIEW2
+# ============================================================
+
+$ErrorActionPreference = "Continue"
+
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host "   CORRECAO DO MICROSOFT TEAMS / WEBVIEW2" -ForegroundColor Cyan
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host ""
+
+# ------------------------------------------------------------
+# 1. Verificar se está executando como Administrador
+# ------------------------------------------------------------
+
+$principal = New-Object Security.Principal.WindowsPrincipal(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+)
+
+if (-not $principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)) {
+    Write-Host "Solicitando permissao de Administrador..." -ForegroundColor Yellow
+
+    Start-Process powershell.exe `
+        -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" `
+        -Verb RunAs
+
+    exit
+}
+
+Write-Host "[OK] Executando como Administrador." -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 2. Fechar completamente o Teams
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[1/7] Fechando Microsoft Teams..." -ForegroundColor Cyan
+
+$processos = @(
+    "ms-teams",
+    "Teams",
+    "MSTeams",
+    "Update"
+)
+
+foreach ($processo in $processos) {
+    Get-Process -Name $processo -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+Start-Sleep -Seconds 3
+
+Write-Host "[OK] Teams fechado." -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 3. Criar pasta de backup
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[2/7] Criando backup do Registro..." -ForegroundColor Cyan
+
+$backup = "$env:SystemDrive\Temp\Teams-WebView2-Backup"
+
+if (-not (Test-Path $backup)) {
+    New-Item -ItemType Directory -Path $backup -Force | Out-Null
+}
+
+$regHKLM = "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+$regHKCU = "HKCU\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+
+reg.exe export "$regHKLM" "$backup\WebView2-HKLM.reg" /y 2>$null
+reg.exe export "$regHKCU" "$backup\WebView2-HKCU.reg" /y 2>$null
+
+Write-Host "[OK] Backup criado em:" -ForegroundColor Green
+Write-Host $backup
+
+
+# ------------------------------------------------------------
+# 4. Remover registros problemáticos do WebView2
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[3/7] Corrigindo registros do WebView2..." -ForegroundColor Cyan
+
+$regPaths = @(
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+    "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+    "HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+)
+
+foreach ($path in $regPaths) {
+
+    if (Test-Path $path) {
+
+        Write-Host "Removendo: $path" -ForegroundColor Yellow
+
+        Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "[OK] Registros antigos tratados." -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 5. Limpar cache do Teams
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[4/7] Limpando cache do Teams..." -ForegroundColor Cyan
+
+$pastasCache = @(
+    "$env:APPDATA\Microsoft\Teams",
+    "$env:LOCALAPPDATA\Microsoft\Teams",
+    "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams",
+    "$env:LOCALAPPDATA\SquirrelTemp"
+)
+
+foreach ($pasta in $pastasCache) {
+
+    if (Test-Path $pasta) {
+
+        Write-Host "Limpando: $pasta" -ForegroundColor Yellow
+
+        Get-ChildItem -Path $pasta -Force -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "[OK] Cache limpo." -ForegroundColor Green
+
+
+# ------------------------------------------------------------
+# 6. Baixar e instalar WebView2
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[5/7] Baixando Microsoft Edge WebView2..." -ForegroundColor Cyan
+
+$temp = "$env:TEMP\TeamsWebView2Fix"
+
+if (Test-Path $temp) {
+    Remove-Item $temp -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+New-Item -ItemType Directory -Path $temp -Force | Out-Null
+
+$installer = "$temp\MicrosoftEdgeWebView2Setup.exe"
+
+$url = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+
+try {
+
+    Invoke-WebRequest `
+        -Uri $url `
+        -OutFile $installer `
+        -UseBasicParsing
+
+    Write-Host "[OK] WebView2 baixado." -ForegroundColor Green
+
+}
+catch {
+
+    Write-Host ""
+    Write-Host "[ERRO] Nao foi possivel baixar o WebView2." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+
+    Write-Host ""
+    Write-Host "Baixe manualmente pelo site oficial da Microsoft:" -ForegroundColor Yellow
+    Write-Host "https://developer.microsoft.com/en-us/microsoft-edge/webview2/" -ForegroundColor Yellow
+
+    pause
+    exit 1
+}
+
+
+Write-Host ""
+Write-Host "[6/7] Instalando WebView2..." -ForegroundColor Cyan
+
+$process = Start-Process `
+    -FilePath $installer `
+    -ArgumentList "/silent", "/install" `
+    -Wait `
+    -PassThru
+
+Write-Host "Codigo de retorno do instalador: $($process.ExitCode)"
+
+Start-Sleep -Seconds 5
+
+
+# ------------------------------------------------------------
+# 7. Verificar instalação
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "[7/7] Verificando instalacao..." -ForegroundColor Cyan
+
+$webViewKeys = @(
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+    "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+    "HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+)
+
+$versaoEncontrada = $null
+
+foreach ($key in $webViewKeys) {
+
+    if (Test-Path $key) {
+
+        try {
+
+            $pv = (Get-ItemProperty -Path $key -Name "pv" -ErrorAction SilentlyContinue).pv
+
+            if ($pv) {
+                $versaoEncontrada = $pv
+                break
+            }
+
+        }
+        catch {}
+    }
+}
+
+Write-Host ""
+
+if ($versaoEncontrada) {
+
+    Write-Host "==============================================" -ForegroundColor Green
+    Write-Host " WEBVIEW2 INSTALADO COM SUCESSO" -ForegroundColor Green
+    Write-Host " Versao: $versaoEncontrada" -ForegroundColor Green
+    Write-Host "==============================================" -ForegroundColor Green
+
+}
+else {
+
+    Write-Host "==============================================" -ForegroundColor Red
+    Write-Host " WEBVIEW2 NAO FOI DETECTADO" -ForegroundColor Red
+    Write-Host "==============================================" -ForegroundColor Red
+
+}
+
+
+# ------------------------------------------------------------
+# Tentar abrir o Teams
+# ------------------------------------------------------------
+
+Write-Host ""
+Write-Host "Procurando Microsoft Teams..." -ForegroundColor Cyan
+
+$teamsExe = $null
+
+$candidatos = @(
+    "$env:LOCALAPPDATA\Microsoft\Teams\current\Teams.exe",
+    "$env:LOCALAPPDATA\Microsoft\Teams\Update.exe",
+    "$env:LOCALAPPDATA\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Local\Microsoft\MSTeams\current\Teams.exe"
+)
+
+foreach ($candidato in $candidatos) {
+
+    if (Test-Path $candidato) {
+        $teamsExe = $candidato
+        break
+    }
+}
+
+if ($teamsExe) {
+
+    Write-Host "Abrindo Teams..." -ForegroundColor Green
+
+    Start-Process $teamsExe
+
+}
+else {
+
+    Write-Host ""
+    Write-Host "Teams nao encontrado no caminho tradicional." -ForegroundColor Yellow
+    Write-Host "Tente abrir o Teams manualmente." -ForegroundColor Yellow
+}
+
+
+Write-Host ""
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host " PROCESSO CONCLUIDO" -ForegroundColor Cyan
+Write-Host "==============================================" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "Se o Teams ainda apresentar o erro, reinicie o computador." -ForegroundColor Yellow
+Write-Host ""
+
+pause
