@@ -1,0 +1,1049 @@
+```powershell
+#requires -RunAsAdministrator
+
+<#
+===============================================================
+ WINDOWS UPDATE RISK ANALYZER v2.0
+ ===============================================================
+ Ferramenta local de análise pós-Windows Update.
+
+ Analisa:
+ - Atualizações/KBs recentes
+ - Correlação temporal KB -> eventos críticos
+ - Blue Screen / BugCheck
+ - Kernel-Power
+ - WHEA-Logger
+ - Falhas de drivers
+ - Erros de armazenamento
+ - Eventos críticos do Windows
+ - Integridade do sistema (DISM / SFC)
+ - Estado do Windows Update
+ - Score de risco
+ - Relatório TXT
+ - Relatório HTML
+
+ IMPORTANTE:
+ - NÃO remove atualizações
+ - NÃO altera configurações
+ - NÃO desinstala drivers
+ - NÃO executa ações destrutivas
+
+ O resultado indica CORRELAÇÃO e RISCO.
+ Não determina sozinho a causa de uma falha.
+===============================================================
+#>
+
+$ErrorActionPreference = "SilentlyContinue"
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+$Version = "2.0"
+
+$ComputerName = $env:COMPUTERNAME
+$StartTime = Get-Date
+
+$HoursToAnalyze = 72
+
+$OutputFolder = "$env:USERPROFILE\Desktop\Windows-Update-Risk-Analyzer"
+
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+$TimeStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+
+$TxtReport  = "$OutputFolder\Windows-Update-Risk-$ComputerName-$TimeStamp.txt"
+$HtmlReport = "$OutputFolder\Windows-Update-Risk-$ComputerName-$TimeStamp.html"
+
+# ============================================================
+# CORES DO CONSOLE
+# ============================================================
+
+function Write-Title {
+    param([string]$Text)
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host " $Text" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+}
+
+function Write-OK {
+    param([string]$Text)
+
+    Write-Host "[OK] $Text" -ForegroundColor Green
+}
+
+function Write-Warning {
+    param([string]$Text)
+
+    Write-Host "[!] $Text" -ForegroundColor Yellow
+}
+
+function Write-Info {
+    param([string]$Text)
+
+    Write-Host "[i] $Text" -ForegroundColor White
+}
+
+# ============================================================
+# INÍCIO
+# ============================================================
+
+Clear-Host
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "       WINDOWS UPDATE RISK ANALYZER v$Version" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Computador : $ComputerName"
+Write-Host "Análise    : Últimas $HoursToAnalyze horas"
+Write-Host "Início     : $StartTime"
+Write-Host ""
+
+# ============================================================
+# SCORE
+# ============================================================
+
+$RiskScore = 0
+
+$Findings = New-Object System.Collections.Generic.List[string]
+
+$CriticalFindings = New-Object System.Collections.Generic.List[string]
+
+$UpdateAnalysis = New-Object System.Collections.Generic.List[object]
+
+# ============================================================
+# WINDOWS
+# ============================================================
+
+Write-Title "1. SISTEMA OPERATIVO"
+
+$OS = Get-CimInstance Win32_OperatingSystem
+
+$OSName = $OS.Caption
+$OSVersion = $OS.Version
+$OSBuild = $OS.BuildNumber
+
+Write-Info "Sistema : $OSName"
+Write-Info "Versão  : $OSVersion"
+Write-Info "Build   : $OSBuild"
+
+# ============================================================
+# DATA LIMITE
+# ============================================================
+
+$AnalysisStart = (Get-Date).AddHours(-$HoursToAnalyze)
+
+Write-Info "Período analisado desde: $AnalysisStart"
+
+# ============================================================
+# ATUALIZAÇÕES
+# ============================================================
+
+Write-Title "2. ATUALIZAÇÕES RECENTES"
+
+$Updates = Get-HotFix |
+    Where-Object {
+        $_.InstalledOn -and
+        $_.InstalledOn -ge $AnalysisStart
+    } |
+    Sort-Object InstalledOn -Descending
+
+if ($Updates) {
+
+    foreach ($Update in $Updates) {
+
+        $KB = $Update.HotFixID
+        $InstallDate = $Update.InstalledOn
+
+        Write-Info "$KB | Instalada em $InstallDate"
+
+        $UpdateAnalysis.Add(
+            [PSCustomObject]@{
+                KB = $KB
+                Data = $InstallDate
+                BugCheck = 0
+                KernelPower = 0
+                WHEA = 0
+                Critical = 0
+                Risk = 0
+            }
+        )
+    }
+
+}
+else {
+
+    Write-Warning "Nenhuma atualização encontrada nas últimas $HoursToAnalyze horas."
+}
+
+# ============================================================
+# EVENTOS DO SISTEMA
+# ============================================================
+
+Write-Title "3. COLETA DE EVENTOS"
+
+Write-Info "Analisando eventos do Windows..."
+
+$SystemEvents = Get-WinEvent `
+    -FilterHashtable @{
+        LogName = "System"
+        StartTime = $AnalysisStart
+    } `
+    -ErrorAction SilentlyContinue
+
+if (-not $SystemEvents) {
+
+    Write-Warning "Não foi possível obter eventos do System."
+}
+
+# ============================================================
+# BUGCHECK
+# ============================================================
+
+Write-Title "4. BLUE SCREEN / BUGCHECK"
+
+$BugChecks = $SystemEvents |
+    Where-Object {
+        $_.Id -eq 1001
+    }
+
+$BugCheckCount = @($BugChecks).Count
+
+if ($BugCheckCount -gt 0) {
+
+    Write-Warning "$BugCheckCount evento(s) BugCheck encontrado(s)."
+
+    $RiskScore += 35
+
+    $Findings.Add(
+        "Foram encontrados $BugCheckCount eventos BugCheck/Blue Screen."
+    )
+
+    $CriticalFindings.Add(
+        "Blue Screen / BugCheck detectado."
+    )
+
+    foreach ($Event in $BugChecks) {
+
+        Write-Host ""
+        Write-Host "BugCheck: $($Event.TimeCreated)" -ForegroundColor Red
+    }
+
+}
+else {
+
+    Write-OK "Nenhum BugCheck encontrado no período."
+}
+
+# ============================================================
+# KERNEL POWER
+# ============================================================
+
+Write-Title "5. KERNEL-POWER"
+
+$KernelPower = $SystemEvents |
+    Where-Object {
+        $_.Id -eq 41
+    }
+
+$KernelPowerCount = @($KernelPower).Count
+
+if ($KernelPowerCount -gt 0) {
+
+    Write-Warning "$KernelPowerCount evento(s) Kernel-Power encontrado(s)."
+
+    if ($KernelPowerCount -ge 5) {
+
+        $RiskScore += 20
+
+    }
+    else {
+
+        $RiskScore += 10
+    }
+
+    $Findings.Add(
+        "Foram encontrados $KernelPowerCount eventos Kernel-Power."
+    )
+
+}
+else {
+
+    Write-OK "Nenhum Kernel-Power encontrado."
+}
+
+# ============================================================
+# WHEA
+# ============================================================
+
+Write-Title "6. WHEA / HARDWARE"
+
+$WHEA = $SystemEvents |
+    Where-Object {
+        $_.ProviderName -eq "Microsoft-Windows-WHEA-Logger"
+    }
+
+$WHEACount = @($WHEA).Count
+
+if ($WHEACount -gt 0) {
+
+    Write-Warning "$WHEACount evento(s) WHEA encontrado(s)."
+
+    $RiskScore += 25
+
+    $Findings.Add(
+        "Foram encontrados $WHEACount eventos WHEA-Logger."
+    )
+
+    $CriticalFindings.Add(
+        "WHEA detectado: investigar hardware, firmware ou drivers."
+    )
+
+}
+else {
+
+    Write-OK "Nenhum WHEA encontrado."
+}
+
+# ============================================================
+# EVENTOS CRÍTICOS
+# ============================================================
+
+Write-Title "7. EVENTOS CRÍTICOS"
+
+$CriticalEvents = $SystemEvents |
+    Where-Object {
+        $_.LevelDisplayName -eq "Critical"
+    }
+
+$CriticalCount = @($CriticalEvents).Count
+
+if ($CriticalCount -gt 0) {
+
+    Write-Warning "$CriticalCount evento(s) crítico(s) encontrado(s)."
+
+    if ($CriticalCount -ge 10) {
+
+        $RiskScore += 15
+
+    }
+    else {
+
+        $RiskScore += 5
+    }
+
+    $Findings.Add(
+        "$CriticalCount eventos críticos encontrados."
+    )
+
+}
+else {
+
+    Write-OK "Nenhum evento crítico encontrado."
+}
+
+# ============================================================
+# ARMAZENAMENTO
+# ============================================================
+
+Write-Title "8. ARMAZENAMENTO"
+
+$StorageProviders = @(
+    "disk",
+    "storahci",
+    "stornvme",
+    "iaStorA",
+    "Ntfs"
+)
+
+$StorageEvents = $SystemEvents |
+    Where-Object {
+        $StorageProviders -contains $_.ProviderName
+    }
+
+$StorageCount = @($StorageEvents).Count
+
+if ($StorageCount -gt 0) {
+
+    Write-Warning "$StorageCount evento(s) relacionados com armazenamento."
+
+    $RiskScore += 15
+
+    $Findings.Add(
+        "$StorageCount eventos relacionados com armazenamento."
+    )
+
+}
+else {
+
+    Write-OK "Nenhum evento relevante de armazenamento encontrado."
+}
+
+# ============================================================
+# DRIVERS
+# ============================================================
+
+Write-Title "9. DRIVERS / DISPOSITIVOS"
+
+$ProblemDevices = Get-CimInstance Win32_PnPEntity |
+    Where-Object {
+        $_.ConfigManagerErrorCode -ne 0
+    }
+
+$ProblemDeviceCount = @($ProblemDevices).Count
+
+if ($ProblemDeviceCount -gt 0) {
+
+    Write-Warning "$ProblemDeviceCount dispositivo(s) com problemas."
+
+    foreach ($Device in $ProblemDevices) {
+
+        Write-Host ""
+        Write-Host "Dispositivo: $($Device.Name)" -ForegroundColor Yellow
+        Write-Host "Código: $($Device.ConfigManagerErrorCode)"
+    }
+
+    $RiskScore += 15
+
+    $Findings.Add(
+        "$ProblemDeviceCount dispositivos apresentam problemas."
+    )
+
+}
+else {
+
+    Write-OK "Nenhum dispositivo com erro detectado."
+}
+
+# ============================================================
+# CORRELAÇÃO UPDATE -> EVENTOS
+# ============================================================
+
+Write-Title "10. CORRELAÇÃO KB -> PROBLEMAS"
+
+if ($Updates) {
+
+    foreach ($Update in $Updates) {
+
+        $KB = $Update.HotFixID
+        $InstallDate = $Update.InstalledOn
+
+        $WindowEnd = $InstallDate.AddHours(72)
+
+        $RelatedEvents = $SystemEvents |
+            Where-Object {
+                $_.TimeCreated -ge $InstallDate -and
+                $_.TimeCreated -le $WindowEnd
+            }
+
+        $RelatedBugChecks = @(
+            $RelatedEvents |
+            Where-Object { $_.Id -eq 1001 }
+        ).Count
+
+        $RelatedKernel = @(
+            $RelatedEvents |
+            Where-Object { $_.Id -eq 41 }
+        ).Count
+
+        $RelatedWHEA = @(
+            $RelatedEvents |
+            Where-Object {
+                $_.ProviderName -eq "Microsoft-Windows-WHEA-Logger"
+            }
+        ).Count
+
+        $RelatedCritical = @(
+            $RelatedEvents |
+            Where-Object {
+                $_.LevelDisplayName -eq "Critical"
+            }
+        ).Count
+
+        $KBScore = 0
+
+        if ($RelatedBugChecks -gt 0) {
+            $KBScore += 40
+        }
+
+        if ($RelatedWHEA -gt 0) {
+            $KBScore += 30
+        }
+
+        if ($RelatedKernel -gt 0) {
+            $KBScore += 20
+        }
+
+        if ($RelatedCritical -gt 0) {
+            $KBScore += 10
+        }
+
+        if ($KBScore -gt 100) {
+            $KBScore = 100
+        }
+
+        $RiskLabel = "BAIXO"
+
+        if ($KBScore -ge 70) {
+            $RiskLabel = "ALTO"
+        }
+        elseif ($KBScore -ge 40) {
+            $RiskLabel = "ATENÇÃO"
+        }
+
+        Write-Host ""
+        Write-Host "KB: $KB" -ForegroundColor Cyan
+        Write-Host "Instalação: $InstallDate"
+        Write-Host "BugCheck: $RelatedBugChecks"
+        Write-Host "Kernel-Power: $RelatedKernel"
+        Write-Host "WHEA: $RelatedWHEA"
+        Write-Host "Críticos: $RelatedCritical"
+        Write-Host "Score: $KBScore / 100"
+        Write-Host "Risco: $RiskLabel"
+
+        $UpdateAnalysis.Add(
+            [PSCustomObject]@{
+                KB = $KB
+                Data = $InstallDate
+                BugCheck = $RelatedBugChecks
+                KernelPower = $RelatedKernel
+                WHEA = $RelatedWHEA
+                Critical = $RelatedCritical
+                Risk = $KBScore
+            }
+        )
+    }
+
+}
+else {
+
+    Write-Info "Sem KBs recentes para correlacionar."
+}
+
+# ============================================================
+# SFC
+# ============================================================
+
+Write-Title "11. INTEGRIDADE DO WINDOWS - SFC"
+
+Write-Info "Executando SFC /verifyonly..."
+Write-Info "Aguarde..."
+
+$SFCOutput = & sfc.exe /verifyonly 2>&1
+
+$SFCText = $SFCOutput -join "`n"
+
+if ($SFCText -match "did not find any integrity violations") {
+
+    $SFCStatus = "OK"
+
+    Write-OK "SFC não encontrou violações de integridade."
+
+}
+elseif ($SFCText -match "found integrity violations") {
+
+    $SFCStatus = "PROBLEMAS DETECTADOS"
+
+    Write-Warning "SFC encontrou possíveis problemas."
+
+    $RiskScore += 15
+
+    $Findings.Add(
+        "SFC encontrou violações de integridade."
+    )
+
+}
+else {
+
+    $SFCStatus = "VERIFICAR"
+
+    Write-Warning "Não foi possível determinar automaticamente o resultado do SFC."
+}
+
+# ============================================================
+# DISM
+# ============================================================
+
+Write-Title "12. DISM"
+
+Write-Info "Executando DISM /CheckHealth..."
+
+$DISMOutput = & DISM.exe /Online /Cleanup-Image /CheckHealth 2>&1
+
+$DISMText = $DISMOutput -join "`n"
+
+if ($DISMText -match "No component store corruption detected") {
+
+    $DISMStatus = "OK"
+
+    Write-OK "DISM não detectou corrupção do Component Store."
+
+}
+elseif ($DISMText -match "corruption") {
+
+    $DISMStatus = "PROBLEMAS DETECTADOS"
+
+    Write-Warning "DISM indicou possível corrupção."
+
+    $RiskScore += 15
+
+    $Findings.Add(
+        "DISM indicou possível corrupção do Component Store."
+    )
+
+}
+else {
+
+    $DISMStatus = "VERIFICAR"
+
+    Write-Warning "Resultado do DISM requer verificação."
+}
+
+# ============================================================
+# WINDOWS UPDATE
+# ============================================================
+
+Write-Title "13. SERVIÇO WINDOWS UPDATE"
+
+$WUService = Get-Service -Name wuauserv
+
+if ($WUService) {
+
+    $WUStatus = $WUService.Status
+
+    if ($WUStatus -eq "Running") {
+
+        Write-OK "Windows Update: Running"
+
+    }
+    else {
+
+        Write-Info "Windows Update: $WUStatus"
+    }
+
+}
+else {
+
+    $WUStatus = "Não encontrado"
+
+    Write-Warning "Serviço Windows Update não encontrado."
+}
+
+# ============================================================
+# SCORE FINAL
+# ============================================================
+
+if ($RiskScore -gt 100) {
+    $RiskScore = 100
+}
+
+if ($RiskScore -le 20) {
+
+    $RiskLevel = "BAIXO"
+    $RiskColor = "Green"
+
+}
+elseif ($RiskScore -le 40) {
+
+    $RiskLevel = "ATENÇÃO"
+    $RiskColor = "Yellow"
+
+}
+elseif ($RiskScore -le 70) {
+
+    $RiskLevel = "ALTO"
+    $RiskColor = "DarkYellow"
+
+}
+else {
+
+    $RiskLevel = "CRÍTICO"
+    $RiskColor = "Red"
+}
+
+# ============================================================
+# RESULTADO
+# ============================================================
+
+Write-Title "14. RESULTADO FINAL"
+
+Write-Host ""
+Write-Host "SCORE DE RISCO: $RiskScore / 100" -ForegroundColor $RiskColor
+Write-Host "NÍVEL DE RISCO : $RiskLevel" -ForegroundColor $RiskColor
+Write-Host ""
+
+if ($Findings.Count -eq 0) {
+
+    Write-OK "Nenhum indicador relevante de instabilidade encontrado."
+
+}
+else {
+
+    foreach ($Finding in $Findings) {
+
+        Write-Warning $Finding
+    }
+}
+
+# ============================================================
+# CONCLUSÃO
+# ============================================================
+
+Write-Title "15. CONCLUSÃO"
+
+if ($RiskScore -le 20) {
+
+    $Conclusion = "O sistema apresenta poucos indicadores de instabilidade."
+
+    Write-OK $Conclusion
+
+}
+elseif ($RiskScore -le 40) {
+
+    $Conclusion = "Foram encontrados alguns indicadores que devem ser monitorizados."
+
+    Write-Warning $Conclusion
+
+}
+elseif ($RiskScore -le 70) {
+
+    $Conclusion = "Existem indicadores relevantes de instabilidade. Recomenda-se investigação."
+
+    Write-Warning $Conclusion
+
+}
+else {
+
+    $Conclusion = "Foram encontrados vários indicadores críticos. Recomenda-se investigação antes de novas alterações."
+
+    Write-Host $Conclusion -ForegroundColor Red
+}
+
+# ============================================================
+# RELATÓRIO TXT
+# ============================================================
+
+$TXT = @()
+
+$TXT += "WINDOWS UPDATE RISK ANALYZER v$Version"
+$TXT += "============================================================"
+$TXT += "Computador       : $ComputerName"
+$TXT += "Sistema          : $OSName"
+$TXT += "Versão           : $OSVersion"
+$TXT += "Build            : $OSBuild"
+$TXT += "Período          : Últimas $HoursToAnalyze horas"
+$TXT += "Data da análise  : $StartTime"
+$TXT += ""
+$TXT += "SCORE DE RISCO   : $RiskScore / 100"
+$TXT += "NÍVEL DE RISCO   : $RiskLevel"
+$TXT += ""
+$TXT += "INDICADORES"
+$TXT += "------------------------------------------------------------"
+$TXT += "BugCheck         : $BugCheckCount"
+$TXT += "Kernel-Power     : $KernelPowerCount"
+$TXT += "WHEA             : $WHEACount"
+$TXT += "Eventos críticos : $CriticalCount"
+$TXT += "Storage Events   : $StorageCount"
+$TXT += "Dispositivos     : $ProblemDeviceCount"
+$TXT += "SFC              : $SFCStatus"
+$TXT += "DISM             : $DISMStatus"
+$TXT += "Windows Update   : $WUStatus"
+$TXT += ""
+$TXT += "ATUALIZAÇÕES ANALISADAS"
+$TXT += "------------------------------------------------------------"
+
+foreach ($Item in $UpdateAnalysis) {
+
+    $TXT += "$($Item.KB) | $($Item.Data) | Score $($Item.Risk)/100 | BugCheck $($Item.BugCheck) | WHEA $($Item.WHEA) | Kernel $($Item.KernelPower)"
+}
+
+$TXT += ""
+$TXT += "CONCLUSÃO"
+$TXT += "------------------------------------------------------------"
+$TXT += $Conclusion
+$TXT += ""
+$TXT += "AVISO: Correlação temporal não prova causalidade."
+$TXT += "============================================================"
+
+$TXT | Out-File -FilePath $TxtReport -Encoding UTF8 -Force
+
+# ============================================================
+# RELATÓRIO HTML
+# ============================================================
+
+$UpdateRows = ""
+
+foreach ($Item in $UpdateAnalysis) {
+
+    $Class = "low"
+
+    if ($Item.Risk -ge 70) {
+        $Class = "high"
+    }
+    elseif ($Item.Risk -ge 40) {
+        $Class = "medium"
+    }
+
+    $UpdateRows += @"
+<tr>
+<td>$($Item.KB)</td>
+<td>$($Item.Data)</td>
+<td>$($Item.BugCheck)</td>
+<td>$($Item.KernelPower)</td>
+<td>$($Item.WHEA)</td>
+<td>$($Item.Critical)</td>
+<td class="$Class">$($Item.Risk)/100</td>
+</tr>
+"@
+}
+
+$HTML = @"
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+
+<meta charset="UTF-8">
+
+<title>Windows Update Risk Analyzer</title>
+
+<style>
+
+body {
+    font-family: Arial, Helvetica, sans-serif;
+    background: #f4f6f8;
+    margin: 40px;
+    color: #202124;
+}
+
+.container {
+    max-width: 1100px;
+    margin: auto;
+    background: white;
+    padding: 35px;
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,.08);
+}
+
+h1 {
+    margin-bottom: 5px;
+}
+
+.subtitle {
+    color: #666;
+    margin-bottom: 30px;
+}
+
+.score {
+    font-size: 42px;
+    font-weight: bold;
+    margin: 20px 0;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 20px;
+}
+
+th {
+    background: #202124;
+    color: white;
+    padding: 12px;
+    text-align: left;
+}
+
+td {
+    padding: 10px;
+    border-bottom: 1px solid #ddd;
+}
+
+.low {
+    color: #16803c;
+    font-weight: bold;
+}
+
+.medium {
+    color: #b06000;
+    font-weight: bold;
+}
+
+.high {
+    color: #c5221f;
+    font-weight: bold;
+}
+
+.card {
+    display: inline-block;
+    width: 21%;
+    margin: 1%;
+    padding: 20px;
+    background: #f8f9fa;
+    border-radius: 10px;
+}
+
+.card-title {
+    font-size: 13px;
+    color: #666;
+}
+
+.card-value {
+    font-size: 25px;
+    font-weight: bold;
+    margin-top: 8px;
+}
+
+.warning {
+    background: #fff4e5;
+    padding: 18px;
+    border-radius: 8px;
+    margin-top: 25px;
+}
+
+.footer {
+    margin-top: 30px;
+    color: #777;
+    font-size: 12px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>Windows Update Risk Analyzer</h1>
+
+<div class="subtitle">
+Versão $Version · $ComputerName · $StartTime
+</div>
+
+<div class="score">
+Risk Score: $RiskScore / 100
+</div>
+
+<h2>Resultado: $RiskLevel</h2>
+
+<div>
+
+<div class="card">
+<div class="card-title">BugCheck</div>
+<div class="card-value">$BugCheckCount</div>
+</div>
+
+<div class="card">
+<div class="card-title">Kernel-Power</div>
+<div class="card-value">$KernelPowerCount</div>
+</div>
+
+<div class="card">
+<div class="card-title">WHEA</div>
+<div class="card-value">$WHEACount</div>
+</div>
+
+<div class="card">
+<div class="card-title">Eventos Críticos</div>
+<div class="card-value">$CriticalCount</div>
+</div>
+
+</div>
+
+<h2>Informações do sistema</h2>
+
+<p><b>Sistema:</b> $OSName</p>
+<p><b>Versão:</b> $OSVersion</p>
+<p><b>Build:</b> $OSBuild</p>
+
+<h2>Atualizações analisadas</h2>
+
+<table>
+
+<tr>
+<th>KB</th>
+<th>Instalação</th>
+<th>BugCheck</th>
+<th>Kernel-Power</th>
+<th>WHEA</th>
+<th>Críticos</th>
+<th>Risco</th>
+</tr>
+
+$UpdateRows
+
+</table>
+
+<h2>Integridade do Windows</h2>
+
+<p><b>SFC:</b> $SFCStatus</p>
+<p><b>DISM:</b> $DISMStatus</p>
+<p><b>Windows Update:</b> $WUStatus</p>
+
+<h2>Conclusão</h2>
+
+<p>$Conclusion</p>
+
+<div class="warning">
+
+<b>Importante:</b><br>
+
+O resultado representa uma análise de risco e correlação temporal.
+A presença de eventos após uma atualização não prova que a atualização
+seja a causa do problema.
+
+Drivers, hardware, BIOS, firmware, software de terceiros e corrupção
+do sistema também podem provocar instabilidade.
+
+</div>
+
+<div class="footer">
+
+Windows Update Risk Analyzer v$Version<br>
+Ferramenta local de diagnóstico PowerShell.
+
+</div>
+
+</div>
+
+</body>
+</html>
+"@
+
+$HTML | Out-File -FilePath $HtmlReport -Encoding UTF8 -Force
+
+# ============================================================
+# FINAL
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host "              ANÁLISE CONCLUÍDA" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host ""
+
+Write-Host "Score final : $RiskScore / 100" -ForegroundColor $RiskColor
+Write-Host "Risco       : $RiskLevel" -ForegroundColor $RiskColor
+
+Write-Host ""
+Write-Host "Relatórios criados:" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "TXT :" -ForegroundColor White
+Write-Host $TxtReport
+Write-Host ""
+Write-Host "HTML:" -ForegroundColor White
+Write-Host $HtmlReport
+
+Write-Host ""
+Write-Host "A abrir relatório HTML..." -ForegroundColor Cyan
+
+Start-Process $HtmlReport
+
+Write-Host ""
+Write-Host "Pressione ENTER para sair..."
+Read-Host
+```
