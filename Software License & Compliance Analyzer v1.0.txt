@@ -1,0 +1,1230 @@
+#requires -Version 5.1
+
+<#
+====================================================================
+ SOFTWARE LICENSE & COMPLIANCE ANALYZER
+ Versão: 1.0
+
+ Auditoria local de software instalado no Windows.
+
+ Analisa:
+ - Software instalado via Registro
+ - Aplicações Microsoft Store / AppX
+ - Publisher / fabricante
+ - Versão
+ - Data de instalação
+ - Local de instalação
+ - Assinatura digital de executáveis
+ - Indicadores de crack / activator / keygen / KMS
+ - Localizações potencialmente suspeitas
+ - Score individual de risco
+ - Score geral do computador
+
+ Gera:
+ - Relatório TXT
+ - Relatório CSV
+ - Relatório HTML profissional
+
+ IMPORTANTE:
+ Este script NÃO determina legalmente se uma licença é legítima.
+ Ele identifica INDICADORES TÉCNICOS que merecem validação.
+
+ O script NÃO:
+ - Remove software
+ - Desinstala programas
+ - Altera licenças
+ - Desativa antivírus
+ - Modifica o sistema
+====================================================================
+#>
+
+$ErrorActionPreference = "SilentlyContinue"
+
+# ================================================================
+# CONFIGURAÇÃO
+# ================================================================
+
+$Version = "1.0"
+
+$ComputerName = $env:COMPUTERNAME
+$UserName = $env:USERNAME
+$StartTime = Get-Date
+
+$OutputFolder = "$env:USERPROFILE\Desktop\Software-Compliance-Analyzer"
+
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+$TimeStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+
+$TxtReport  = "$OutputFolder\Software-Compliance-$ComputerName-$TimeStamp.txt"
+$CsvReport  = "$OutputFolder\Software-Compliance-$ComputerName-$TimeStamp.csv"
+$HtmlReport = "$OutputFolder\Software-Compliance-$ComputerName-$TimeStamp.html"
+
+# ================================================================
+# INDICADORES DE RISCO
+# ================================================================
+
+$SuspiciousKeywords = @(
+    "crack",
+    "cracked",
+    "keygen",
+    "key generator",
+    "activator",
+    "activation bypass",
+    "license bypass",
+    "loader",
+    "patcher",
+    "patch",
+    "kmsauto",
+    "kmspico",
+    "autokms",
+    "kms",
+    "hwid",
+    "office activator",
+    "windows activator",
+    "license activator",
+    "serial generator",
+    "serial key generator"
+)
+
+$SuspiciousPaths = @(
+    "\crack",
+    "\cracked",
+    "\keygen",
+    "\activator",
+    "\kms",
+    "\kmspico",
+    "\autokms",
+    "\loader",
+    "\patcher"
+)
+
+# ================================================================
+# ARRAYS
+# ================================================================
+
+$SoftwareList = New-Object System.Collections.Generic.List[object]
+
+$GlobalFindings = New-Object System.Collections.Generic.List[string]
+
+# ================================================================
+# FUNÇÕES
+# ================================================================
+
+function Write-Header {
+    param(
+        [string]$Text
+    )
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host " $Text" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+}
+
+function Write-OK {
+    param(
+        [string]$Text
+    )
+
+    Write-Host "[OK] $Text" -ForegroundColor Green
+}
+
+function Write-WarningMessage {
+    param(
+        [string]$Text
+    )
+
+    Write-Host "[!] $Text" -ForegroundColor Yellow
+}
+
+function Write-Risk {
+    param(
+        [string]$Text
+    )
+
+    Write-Host "[RISCO] $Text" -ForegroundColor Red
+}
+
+function Get-RiskLevel {
+
+    param(
+        [int]$Score
+    )
+
+    if ($Score -ge 70) {
+        return "ALTO"
+    }
+
+    if ($Score -ge 40) {
+        return "MÉDIO"
+    }
+
+    if ($Score -ge 20) {
+        return "ATENÇÃO"
+    }
+
+    return "BAIXO"
+}
+
+function Get-RiskColor {
+
+    param(
+        [string]$Risk
+    )
+
+    switch ($Risk) {
+
+        "ALTO" {
+            return "Red"
+        }
+
+        "MÉDIO" {
+            return "DarkYellow"
+        }
+
+        "ATENÇÃO" {
+            return "Yellow"
+        }
+
+        default {
+            return "Green"
+        }
+    }
+}
+
+function Test-SuspiciousText {
+
+    param(
+        [string]$Text
+    )
+
+    $Matches = New-Object System.Collections.Generic.List[string]
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $Matches
+    }
+
+    $LowerText = $Text.ToLower()
+
+    foreach ($Keyword in $SuspiciousKeywords) {
+
+        if ($LowerText.Contains($Keyword.ToLower())) {
+
+            if (-not $Matches.Contains($Keyword)) {
+                $Matches.Add($Keyword)
+            }
+        }
+    }
+
+    return $Matches
+}
+
+function Get-SignatureStatus {
+
+    param(
+        [string]$InstallLocation
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InstallLocation)) {
+        return "NÃO ANALISADA"
+    }
+
+    if (-not (Test-Path $InstallLocation)) {
+        return "CAMINHO NÃO ENCONTRADO"
+    }
+
+    try {
+
+        $Executables = Get-ChildItem `
+            -Path $InstallLocation `
+            -Filter "*.exe" `
+            -File `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 10
+
+        if (-not $Executables) {
+            return "NENHUM EXE ENCONTRADO"
+        }
+
+        $Unsigned = 0
+        $Valid = 0
+        $Unknown = 0
+
+        foreach ($Exe in $Executables) {
+
+            $Signature = Get-AuthenticodeSignature `
+                -FilePath $Exe.FullName `
+                -ErrorAction SilentlyContinue
+
+            switch ($Signature.Status) {
+
+                "Valid" {
+                    $Valid++
+                }
+
+                "NotSigned" {
+                    $Unsigned++
+                }
+
+                default {
+                    $Unknown++
+                }
+            }
+        }
+
+        if ($Unsigned -gt 0 -and $Valid -eq 0) {
+            return "SEM ASSINATURA"
+        }
+
+        if ($Unsigned -gt 0) {
+            return "MISTA"
+        }
+
+        if ($Valid -gt 0) {
+            return "ASSINADA"
+        }
+
+        return "NÃO CONFIRMADA"
+
+    }
+    catch {
+
+        return "ERRO NA ANÁLISE"
+    }
+}
+
+# ================================================================
+# VERIFICAR ADMINISTRADOR
+# ================================================================
+
+$Principal = New-Object Security.Principal.WindowsPrincipal(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+)
+
+$IsAdmin = $Principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+
+if (-not $IsAdmin) {
+
+    Write-Host ""
+    Write-Host "Este script deve ser executado como Administrador." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Solicitando elevação..." -ForegroundColor Cyan
+
+    Start-Process powershell.exe `
+        -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" `
+        -Verb RunAs
+
+    exit
+}
+
+# ================================================================
+# INÍCIO
+# ================================================================
+
+Clear-Host
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "       SOFTWARE LICENSE & COMPLIANCE ANALYZER v$Version" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "Computador : $ComputerName"
+Write-Host "Utilizador : $UserName"
+Write-Host "Data       : $StartTime"
+Write-Host ""
+
+# ================================================================
+# 1. SOFTWARE VIA REGISTRO
+# ================================================================
+
+Write-Header "1. INVENTÁRIO DE SOFTWARE"
+
+$RegistryPaths = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
+
+$RegistrySoftware = foreach ($Path in $RegistryPaths) {
+
+    Get-ItemProperty $Path -ErrorAction SilentlyContinue |
+    Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_.DisplayName)
+    }
+}
+
+$UniqueRegistrySoftware = $RegistrySoftware |
+    Sort-Object DisplayName, DisplayVersion -Unique
+
+foreach ($App in $UniqueRegistrySoftware) {
+
+    $Name = $App.DisplayName
+    $Publisher = $App.Publisher
+    $VersionApp = $App.DisplayVersion
+    $InstallDate = $App.InstallDate
+    $InstallLocation = $App.InstallLocation
+
+    if ([string]::IsNullOrWhiteSpace($InstallLocation)) {
+
+        $UninstallString = $App.UninstallString
+
+        if ($UninstallString -and
+            $UninstallString -match '([A-Za-z]:\\[^"]+)') {
+
+            $PossiblePath = $Matches[1]
+
+            if (Test-Path $PossiblePath) {
+                $InstallLocation = Split-Path $PossiblePath -Parent
+            }
+        }
+    }
+
+    $TextToAnalyze = @(
+        $Name
+        $Publisher
+        $InstallLocation
+    ) -join " "
+
+    $Indicators = Test-SuspiciousText $TextToAnalyze
+
+    $Score = 0
+
+    # ------------------------------------------------------------
+    # Publisher
+    # ------------------------------------------------------------
+
+    if ([string]::IsNullOrWhiteSpace($Publisher)) {
+
+        $Score += 10
+    }
+
+    # ------------------------------------------------------------
+    # Indicadores de ativação/crack
+    # ------------------------------------------------------------
+
+    if ($Indicators.Count -gt 0) {
+
+        $Score += ($Indicators.Count * 25)
+
+    }
+
+    # ------------------------------------------------------------
+    # Caminho suspeito
+    # ------------------------------------------------------------
+
+    $LowerPath = $InstallLocation.ToLower()
+
+    foreach ($SuspiciousPath in $SuspiciousPaths) {
+
+        if ($LowerPath.Contains($SuspiciousPath.ToLower())) {
+
+            $Score += 30
+
+            break
+        }
+    }
+
+    # ------------------------------------------------------------
+    # Caminho em AppData / Temp / Public
+    # ------------------------------------------------------------
+
+    if ($LowerPath -match "\\appdata\\local\\temp\\") {
+
+        $Score += 15
+    }
+
+    if ($LowerPath -match "\\users\\public\\") {
+
+        $Score += 15
+    }
+
+    # ------------------------------------------------------------
+    # Assinatura
+    # ------------------------------------------------------------
+
+    $Signature = Get-SignatureStatus $InstallLocation
+
+    if ($Signature -eq "SEM ASSINATURA") {
+
+        $Score += 20
+    }
+
+    # ------------------------------------------------------------
+    # Limite
+    # ------------------------------------------------------------
+
+    if ($Score -gt 100) {
+        $Score = 100
+    }
+
+    $Risk = Get-RiskLevel $Score
+
+    $SoftwareList.Add(
+        [PSCustomObject]@{
+            Nome = $Name
+            Publisher = $Publisher
+            Versao = $VersionApp
+            DataInstalacao = $InstallDate
+            Caminho = $InstallLocation
+            Assinatura = $Signature
+            Indicadores = ($Indicators -join ", ")
+            Score = $Score
+            Risco = $Risk
+            Origem = "Registro"
+        }
+    )
+
+    if ($Score -ge 40) {
+
+        $GlobalFindings.Add(
+            "$Name - risco $Risk - Score $Score"
+        )
+    }
+}
+
+Write-OK "$($SoftwareList.Count) softwares encontrados através do Registro."
+
+# ================================================================
+# 2. MICROSOFT STORE / APPX
+# ================================================================
+
+Write-Header "2. MICROSOFT STORE / APPX"
+
+try {
+
+    $AppxPackages = Get-AppxPackage -AllUsers
+
+    foreach ($Appx in $AppxPackages) {
+
+        if ([string]::IsNullOrWhiteSpace($Appx.Name)) {
+            continue
+        }
+
+        $Name = $Appx.Name
+        $Publisher = $Appx.Publisher
+        $VersionApp = $Appx.Version
+        $InstallLocation = $Appx.InstallLocation
+
+        $Indicators = Test-SuspiciousText (
+            "$Name $Publisher $InstallLocation"
+        )
+
+        $Score = 0
+
+        if ($Indicators.Count -gt 0) {
+
+            $Score += ($Indicators.Count * 25)
+        }
+
+        if ($Score -gt 100) {
+            $Score = 100
+        }
+
+        $Risk = Get-RiskLevel $Score
+
+        $SoftwareList.Add(
+            [PSCustomObject]@{
+                Nome = $Name
+                Publisher = $Publisher
+                Versao = $VersionApp
+                DataInstalacao = ""
+                Caminho = $InstallLocation
+                Assinatura = "APPX / MICROSOFT"
+                Indicadores = ($Indicators -join ", ")
+                Score = $Score
+                Risco = $Risk
+                Origem = "Microsoft Store / AppX"
+            }
+        )
+    }
+
+    Write-OK "$($AppxPackages.Count) pacotes AppX analisados."
+
+}
+catch {
+
+    Write-WarningMessage "Não foi possível analisar todos os pacotes AppX."
+}
+
+# ================================================================
+# 3. ANALISAR ARQUIVOS SUSPEITOS
+# ================================================================
+
+Write-Header "3. PROCURA DE INDICADORES SUSPEITOS"
+
+$SearchLocations = @(
+    "$env:ProgramFiles",
+    "${env:ProgramFiles(x86)}",
+    "$env:LOCALAPPDATA",
+    "$env:APPDATA"
+)
+
+$SuspiciousFiles = New-Object System.Collections.Generic.List[object]
+
+foreach ($Location in $SearchLocations) {
+
+    if (-not (Test-Path $Location)) {
+        continue
+    }
+
+    Write-Info "Analisando: $Location"
+
+    try {
+
+        $Files = Get-ChildItem `
+            -Path $Location `
+            -File `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match "(?i)crack|keygen|activator|kmspico|kmsauto|autokms|loader|patcher|license.?bypass"
+            } |
+            Select-Object -First 100
+
+        foreach ($File in $Files) {
+
+            $Indicators = Test-SuspiciousText $File.FullName
+
+            $Signature = Get-AuthenticodeSignature `
+                -FilePath $File.FullName `
+                -ErrorAction SilentlyContinue
+
+            $SignatureStatus = $Signature.Status
+
+            $SuspiciousFiles.Add(
+                [PSCustomObject]@{
+                    Arquivo = $File.Name
+                    Caminho = $File.FullName
+                    Indicadores = ($Indicators -join ", ")
+                    Assinatura = $SignatureStatus
+                }
+            )
+        }
+    }
+    catch {}
+}
+
+if ($SuspiciousFiles.Count -gt 0) {
+
+    Write-Risk "$($SuspiciousFiles.Count) arquivo(s) com nomes potencialmente suspeitos encontrados."
+
+    $GlobalFindings.Add(
+        "$($SuspiciousFiles.Count) arquivos apresentaram nomes associados a ferramentas de ativação/crack."
+    )
+
+}
+else {
+
+    Write-OK "Nenhum arquivo com padrão suspeito encontrado nas áreas analisadas."
+}
+
+# ================================================================
+# 4. ANALISAR ATIVAÇÃO DO WINDOWS
+# ================================================================
+
+Write-Header "4. LICENCIAMENTO DO WINDOWS"
+
+$WindowsLicense = Get-CimInstance `
+    -ClassName SoftwareLicensingProduct `
+    -Filter "Name LIKE 'Windows%' AND PartialProductKey IS NOT NULL" |
+    Where-Object {
+        $_.LicenseStatus -eq 1
+    } |
+    Select-Object -First 1
+
+if ($WindowsLicense) {
+
+    Write-OK "Windows apresenta licença ativada."
+
+    $WindowsLicenseStatus = "ATIVADO"
+
+}
+else {
+
+    Write-WarningMessage "Não foi possível confirmar uma licença Windows ativada."
+
+    $WindowsLicenseStatus = "NÃO CONFIRMADO"
+
+}
+
+# ================================================================
+# 5. DETECÇÃO DE KMS
+# ================================================================
+
+Write-Header "5. CONFIGURAÇÃO KMS"
+
+$KMSFindings = New-Object System.Collections.Generic.List[string]
+
+try {
+
+    $SLP = Get-CimInstance `
+        -ClassName SoftwareLicensingProduct |
+        Where-Object {
+            $_.Name -like "*Windows*" -and
+            $_.Description -like "*KMS*"
+        }
+
+    if ($SLP) {
+
+        foreach ($Item in $SLP) {
+
+            if ($Item.Description) {
+
+                $KMSFindings.Add($Item.Description)
+            }
+        }
+
+        if ($KMSFindings.Count -gt 0) {
+
+            Write-WarningMessage "Configuração relacionada a KMS encontrada."
+
+            $GlobalFindings.Add(
+                "Foi encontrada configuração relacionada a KMS. Validar se corresponde ao modelo de licenciamento da organização."
+            )
+        }
+    }
+    else {
+
+        Write-OK "Nenhuma configuração KMS identificada nesta verificação."
+    }
+
+}
+catch {}
+
+# ================================================================
+# 6. ESTATÍSTICAS
+# ================================================================
+
+Write-Header "6. RESULTADO DA AUDITORIA"
+
+$TotalSoftware = $SoftwareList.Count
+
+$LowRisk = @(
+    $SoftwareList |
+    Where-Object { $_.Risco -eq "BAIXO" }
+).Count
+
+$AttentionRisk = @(
+    $SoftwareList |
+    Where-Object { $_.Risco -eq "ATENÇÃO" }
+).Count
+
+$MediumRisk = @(
+    $SoftwareList |
+    Where-Object { $_.Risco -eq "MÉDIO" }
+).Count
+
+$HighRisk = @(
+    $SoftwareList |
+    Where-Object { $_.Risco -eq "ALTO" }
+).Count
+
+Write-Host ""
+Write-Host "Software analisado : $TotalSoftware" -ForegroundColor White
+Write-Host ""
+Write-Host "BAIXO              : $LowRisk" -ForegroundColor Green
+Write-Host "ATENÇÃO            : $AttentionRisk" -ForegroundColor Yellow
+Write-Host "MÉDIO              : $MediumRisk" -ForegroundColor DarkYellow
+Write-Host "ALTO               : $HighRisk" -ForegroundColor Red
+Write-Host ""
+
+# ================================================================
+# 7. SOFTWARE DE ALTO RISCO
+# ================================================================
+
+Write-Header "7. SOFTWARES QUE NECESSITAM DE VALIDAÇÃO"
+
+$HighRiskSoftware = $SoftwareList |
+    Where-Object {
+        $_.Score -ge 40
+    } |
+    Sort-Object Score -Descending
+
+if ($HighRiskSoftware) {
+
+    foreach ($Software in $HighRiskSoftware) {
+
+        Write-Host ""
+        Write-Host "------------------------------------------------------------" -ForegroundColor Yellow
+        Write-Host "Software : $($Software.Nome)" -ForegroundColor Yellow
+        Write-Host "Publisher: $($Software.Publisher)"
+        Write-Host "Versão   : $($Software.Versao)"
+        Write-Host "Score    : $($Software.Score)/100"
+        Write-Host "Risco    : $($Software.Risco)"
+        Write-Host "Assinatura: $($Software.Assinatura)"
+        Write-Host "Indicadores: $($Software.Indicadores)"
+        Write-Host "Caminho  : $($Software.Caminho)"
+    }
+
+}
+else {
+
+    Write-OK "Nenhum software apresentou risco elevado nesta análise."
+}
+
+# ================================================================
+# 8. SCORE GERAL
+# ================================================================
+
+$OverallScore = 0
+
+if ($HighRisk -gt 0) {
+
+    $OverallScore += 60
+}
+elseif ($MediumRisk -gt 0) {
+
+    $OverallScore += 35
+}
+elseif ($AttentionRisk -gt 0) {
+
+    $OverallScore += 15
+}
+
+if ($SuspiciousFiles.Count -gt 0) {
+
+    $OverallScore += 25
+}
+
+if ($KMSFindings.Count -gt 0) {
+
+    $OverallScore += 15
+}
+
+if ($OverallScore -gt 100) {
+    $OverallScore = 100
+}
+
+$OverallRisk = Get-RiskLevel $OverallScore
+
+$OverallColor = Get-RiskColor $OverallRisk
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor $OverallColor
+Write-Host "              SOFTWARE COMPLIANCE SCORE" -ForegroundColor $OverallColor
+Write-Host ""
+Write-Host "                    $OverallScore / 100" -ForegroundColor $OverallColor
+Write-Host ""
+Write-Host "                       $OverallRisk" -ForegroundColor $OverallColor
+Write-Host "============================================================" -ForegroundColor $OverallColor
+
+# ================================================================
+# 9. EXPORTAR CSV
+# ================================================================
+
+Write-Header "9. EXPORTANDO RELATÓRIOS"
+
+$SoftwareList |
+    Sort-Object Score -Descending |
+    Export-Csv `
+        -Path $CsvReport `
+        -NoTypeInformation `
+        -Encoding UTF8
+
+Write-OK "CSV criado."
+
+# ================================================================
+# 10. RELATÓRIO TXT
+# ================================================================
+
+$TXT = New-Object System.Collections.Generic.List[string]
+
+$TXT.Add("SOFTWARE LICENSE & COMPLIANCE ANALYZER v$Version")
+$TXT.Add("============================================================")
+$TXT.Add("Computador : $ComputerName")
+$TXT.Add("Utilizador : $UserName")
+$TXT.Add("Data       : $StartTime")
+$TXT.Add("")
+$TXT.Add("SCORE GERAL: $OverallScore / 100")
+$TXT.Add("RISCO      : $OverallRisk")
+$TXT.Add("")
+$TXT.Add("ESTATÍSTICAS")
+$TXT.Add("------------------------------------------------------------")
+$TXT.Add("Total software : $TotalSoftware")
+$TXT.Add("Baixo          : $LowRisk")
+$TXT.Add("Atenção        : $AttentionRisk")
+$TXT.Add("Médio          : $MediumRisk")
+$TXT.Add("Alto           : $HighRisk")
+$TXT.Add("")
+$TXT.Add("WINDOWS")
+$TXT.Add("------------------------------------------------------------")
+$TXT.Add("Licença Windows: $WindowsLicenseStatus")
+$TXT.Add("")
+$TXT.Add("SOFTWARES DE RISCO")
+$TXT.Add("------------------------------------------------------------")
+
+foreach ($Software in $HighRiskSoftware) {
+
+    $TXT.Add("")
+    $TXT.Add("Software   : $($Software.Nome)")
+    $TXT.Add("Publisher  : $($Software.Publisher)")
+    $TXT.Add("Versão     : $($Software.Versao)")
+    $TXT.Add("Score      : $($Software.Score)/100")
+    $TXT.Add("Risco      : $($Software.Risco)")
+    $TXT.Add("Assinatura : $($Software.Assinatura)")
+    $TXT.Add("Indicadores: $($Software.Indicadores)")
+    $TXT.Add("Caminho    : $($Software.Caminho)")
+}
+
+$TXT.Add("")
+$TXT.Add("ARQUIVOS SUSPEITOS")
+$TXT.Add("------------------------------------------------------------")
+
+foreach ($File in $SuspiciousFiles) {
+
+    $TXT.Add(
+        "$($File.Arquivo) | $($File.Caminho) | $($File.Indicadores) | $($File.Assinatura)"
+    )
+}
+
+$TXT.Add("")
+$TXT.Add("AVISO")
+$TXT.Add("------------------------------------------------------------")
+$TXT.Add("Indicadores técnicos não constituem prova legal de pirataria.")
+$TXT.Add("A licença deve ser validada através de documentação de aquisição,")
+$TXT.Add("portal do fabricante, contrato ou sistema de licenciamento.")
+$TXT.Add("")
+$TXT.Add("============================================================")
+
+$TXT |
+    Out-File `
+        -FilePath $TxtReport `
+        -Encoding UTF8 `
+        -Force
+
+Write-OK "TXT criado."
+
+# ================================================================
+# 11. HTML
+# ================================================================
+
+$Rows = ""
+
+foreach ($Software in ($SoftwareList | Sort-Object Score -Descending)) {
+
+    $RiskClass = "low"
+
+    if ($Software.Risco -eq "ATENÇÃO") {
+        $RiskClass = "attention"
+    }
+
+    if ($Software.Risco -eq "MÉDIO") {
+        $RiskClass = "medium"
+    }
+
+    if ($Software.Risco -eq "ALTO") {
+        $RiskClass = "high"
+    }
+
+    $Rows += @"
+<tr>
+<td>$($Software.Nome)</td>
+<td>$($Software.Publisher)</td>
+<td>$($Software.Versao)</td>
+<td>$($Software.Assinatura)</td>
+<td>$($Software.Indicadores)</td>
+<td>$($Software.Score)/100</td>
+<td class="$RiskClass">$($Software.Risco)</td>
+</tr>
+"@
+}
+
+$SuspiciousRows = ""
+
+foreach ($File in $SuspiciousFiles) {
+
+    $SuspiciousRows += @"
+<tr>
+<td>$($File.Arquivo)</td>
+<td>$($File.Caminho)</td>
+<td>$($File.Indicadores)</td>
+<td>$($File.Assinatura)</td>
+</tr>
+"@
+}
+
+$HTML = @"
+<!DOCTYPE html>
+
+<html lang="pt">
+
+<head>
+
+<meta charset="UTF-8">
+
+<title>Software License & Compliance Analyzer</title>
+
+<style>
+
+body {
+    margin: 0;
+    padding: 40px;
+    background: #f3f5f7;
+    font-family: Arial, Helvetica, sans-serif;
+    color: #202124;
+}
+
+.container {
+    max-width: 1250px;
+    margin: auto;
+    background: white;
+    padding: 40px;
+    border-radius: 16px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.08);
+}
+
+h1 {
+    margin-bottom: 5px;
+}
+
+.subtitle {
+    color: #6b7280;
+    margin-bottom: 35px;
+}
+
+.score {
+    font-size: 52px;
+    font-weight: bold;
+    margin: 20px 0;
+}
+
+.cards {
+    display: flex;
+    gap: 15px;
+    margin: 25px 0;
+}
+
+.card {
+    flex: 1;
+    padding: 22px;
+    background: #f8fafc;
+    border-radius: 12px;
+}
+
+.card-title {
+    font-size: 13px;
+    color: #6b7280;
+}
+
+.card-value {
+    font-size: 30px;
+    font-weight: bold;
+    margin-top: 8px;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 20px;
+    font-size: 13px;
+}
+
+th {
+    background: #111827;
+    color: white;
+    padding: 13px;
+    text-align: left;
+}
+
+td {
+    padding: 11px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.low {
+    color: #15803d;
+    font-weight: bold;
+}
+
+.attention {
+    color: #ca8a04;
+    font-weight: bold;
+}
+
+.medium {
+    color: #c2410c;
+    font-weight: bold;
+}
+
+.high {
+    color: #dc2626;
+    font-weight: bold;
+}
+
+.warning {
+    margin-top: 30px;
+    padding: 20px;
+    background: #fff7ed;
+    border-left: 5px solid #f97316;
+    border-radius: 8px;
+}
+
+.footer {
+    margin-top: 35px;
+    color: #6b7280;
+    font-size: 12px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>Software License & Compliance Analyzer</h1>
+
+<div class="subtitle">
+PowerShell v$Version · $ComputerName · $StartTime
+</div>
+
+<div class="score">
+$OverallScore / 100
+</div>
+
+<h2>Risco geral: $OverallRisk</h2>
+
+<div class="cards">
+
+<div class="card">
+<div class="card-title">Software analisado</div>
+<div class="card-value">$TotalSoftware</div>
+</div>
+
+<div class="card">
+<div class="card-title">Baixo risco</div>
+<div class="card-value">$LowRisk</div>
+</div>
+
+<div class="card">
+<div class="card-title">Necessita validação</div>
+<div class="card-value">$($AttentionRisk + $MediumRisk)</div>
+</div>
+
+<div class="card">
+<div class="card-title">Alto risco</div>
+<div class="card-value">$HighRisk</div>
+</div>
+
+</div>
+
+<h2>Licenciamento do Windows</h2>
+
+<p>
+<b>Estado:</b> $WindowsLicenseStatus
+</p>
+
+<h2>Software analisado</h2>
+
+<table>
+
+<tr>
+<th>Software</th>
+<th>Publisher</th>
+<th>Versão</th>
+<th>Assinatura</th>
+<th>Indicadores</th>
+<th>Score</th>
+<th>Risco</th>
+</tr>
+
+$Rows
+
+</table>
+
+<h2>Arquivos potencialmente suspeitos</h2>
+
+<table>
+
+<tr>
+<th>Arquivo</th>
+<th>Caminho</th>
+<th>Indicadores</th>
+<th>Assinatura</th>
+</tr>
+
+$SuspiciousRows
+
+</table>
+
+<div class="warning">
+
+<b>IMPORTANTE</b><br><br>
+
+Este relatório identifica indicadores técnicos de risco.
+A presença de um indicador não prova que determinado software
+seja pirateado ou utilizado sem licença.
+
+A validação definitiva deve ser realizada através de documentação
+de aquisição, contrato, portal do fabricante ou sistema corporativo
+de gestão de licenças.
+
+</div>
+
+<div class="footer">
+
+Software License & Compliance Analyzer v$Version<br>
+Auditoria local realizada em $ComputerName
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+"@
+
+$HTML |
+    Out-File `
+        -FilePath $HtmlReport `
+        -Encoding UTF8 `
+        -Force
+
+Write-OK "HTML criado."
+
+# ================================================================
+# 12. FINAL
+# ================================================================
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host "                 AUDITORIA CONCLUÍDA" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host ""
+
+Write-Host "Software analisado : $TotalSoftware"
+Write-Host "Score geral        : $OverallScore / 100"
+Write-Host "Risco geral        : $OverallRisk" -ForegroundColor $OverallColor
+
+Write-Host ""
+Write-Host "Relatórios:" -ForegroundColor Cyan
+
+Write-Host ""
+Write-Host "TXT :" -ForegroundColor White
+Write-Host $TxtReport
+
+Write-Host ""
+Write-Host "CSV :" -ForegroundColor White
+Write-Host $CsvReport
+
+Write-Host ""
+Write-Host "HTML:" -ForegroundColor White
+Write-Host $HtmlReport
+
+Write-Host ""
+Write-Host "Abrindo relatório HTML..." -ForegroundColor Cyan
+
+Start-Process $HtmlReport
+
+Write-Host ""
+Write-Host "Pressione ENTER para fechar..."
+Read-Host
