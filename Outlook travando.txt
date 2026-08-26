@@ -1,0 +1,1629 @@
+#requires -version 5.1
+
+<#
+.SYNOPSIS
+    Outlook Freeze Diagnostic & Repair v1.1
+
+.DESCRIPTION
+    Ferramenta de diagnóstico e reparação do Microsoft Outlook.
+
+    O script analisa:
+    - CPU / RAM / Disco
+    - Processo Outlook
+    - Add-ins COM
+    - Microsoft Office / Microsoft 365
+    - Microsoft Edge WebView2
+    - OST / PST
+    - Cache do Outlook
+    - Conectividade Microsoft 365
+    - Credenciais/tickets
+    - Eventos do Windows relacionados ao Office/Outlook
+    - Integridade do Windows
+    - Plano de energia
+
+    Modos:
+    1 - Diagnóstico
+    2 - Diagnóstico + Reparação Segura
+    3 - Diagnóstico + Reparação Avançada
+
+    O script NÃO:
+    - Apaga OST/PST
+    - Remove contas
+    - Apaga perfis do Outlook
+    - Desinstala Office
+    - Desativa antivírus
+    - Desativa mecanismos de segurança
+
+.NOTES
+    Versão: 1.1
+    Recomendado: PowerShell 5.1+
+    Execução: Administrador
+#>
+
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
+
+$ErrorActionPreference = "SilentlyContinue"
+
+$BaseFolder = "C:\IT\Outlook-Freeze-Diagnostic"
+
+$TimeStamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+
+$LogFile = Join-Path $BaseFolder "Outlook-Diagnostic-$TimeStamp.log"
+
+$ReportFile = Join-Path $BaseFolder "Outlook-Diagnostic-$TimeStamp.html"
+
+$BackupFolder = Join-Path $BaseFolder "Backup-$TimeStamp"
+
+$ScriptVersion = "1.1"
+
+# ============================================================
+# CRIAÇÃO DAS PASTAS
+# ============================================================
+
+New-Item -Path $BaseFolder -ItemType Directory -Force | Out-Null
+
+# ============================================================
+# VARIÁVEIS DE DIAGNÓSTICO
+# ============================================================
+
+$Issues = New-Object System.Collections.ArrayList
+$Warnings = New-Object System.Collections.ArrayList
+$Successes = New-Object System.Collections.ArrayList
+$Actions = New-Object System.Collections.ArrayList
+
+$Global:OutlookWasRunning = $false
+$Global:RepairMode = 0
+
+# ============================================================
+# FUNÇÃO LOG
+# ============================================================
+
+function Write-Log {
+
+    param(
+        [string]$Message,
+        [ValidateSet(
+            "INFO",
+            "OK",
+            "WARNING",
+            "ERROR",
+            "ACTION"
+        )]
+        [string]$Level = "INFO"
+    )
+
+    $Time = Get-Date -Format "HH:mm:ss"
+
+    switch ($Level) {
+
+        "INFO" {
+            $Color = "White"
+        }
+
+        "OK" {
+            $Color = "Green"
+        }
+
+        "WARNING" {
+            $Color = "Yellow"
+        }
+
+        "ERROR" {
+            $Color = "Red"
+        }
+
+        "ACTION" {
+            $Color = "Cyan"
+        }
+    }
+
+    $Line = "[$Time] [$Level] $Message"
+
+    Write-Host $Line -ForegroundColor $Color
+
+    Add-Content -Path $LogFile -Value $Line
+}
+
+# ============================================================
+# FUNÇÃO SEÇÃO
+# ============================================================
+
+function Write-Section {
+
+    param(
+        [string]$Title
+    )
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host $Title -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+
+    Add-Content -Path $LogFile -Value ""
+    Add-Content -Path $LogFile -Value "============================================================"
+    Add-Content -Path $LogFile -Value $Title
+    Add-Content -Path $LogFile -Value "============================================================"
+}
+
+# ============================================================
+# FUNÇÕES DE RESULTADO
+# ============================================================
+
+function Add-Issue {
+
+    param(
+        [string]$Message
+    )
+
+    [void]$Issues.Add($Message)
+
+    Write-Log $Message "ERROR"
+}
+
+function Add-Warning {
+
+    param(
+        [string]$Message
+    )
+
+    [void]$Warnings.Add($Message)
+
+    Write-Log $Message "WARNING"
+}
+
+function Add-Success {
+
+    param(
+        [string]$Message
+    )
+
+    [void]$Successes.Add($Message)
+
+    Write-Log $Message "OK"
+}
+
+function Add-Action {
+
+    param(
+        [string]$Message
+    )
+
+    [void]$Actions.Add($Message)
+
+    Write-Log $Message "ACTION"
+}
+
+# ============================================================
+# VERIFICA ADMINISTRADOR
+# ============================================================
+
+$Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+
+$Principal = New-Object Security.Principal.WindowsPrincipal($Identity)
+
+$IsAdmin = $Principal.IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+
+if (-not $IsAdmin) {
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host " ERRO: EXECUTE O POWERSHELL COMO ADMINISTRADOR" -ForegroundColor Red
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host ""
+
+    exit 1
+}
+
+# ============================================================
+# MENU
+# ============================================================
+
+Clear-Host
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host "       OUTLOOK FREEZE DIAGNOSTIC & REPAIR v$ScriptVersion" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host ""
+
+Write-Host "[1] Diagnóstico" -ForegroundColor White
+Write-Host "[2] Diagnóstico + Reparação Segura" -ForegroundColor Yellow
+Write-Host "[3] Diagnóstico + Reparação Avançada" -ForegroundColor Red
+Write-Host "[0] Sair" -ForegroundColor Gray
+Write-Host ""
+
+$Menu = Read-Host "Escolha uma opção"
+
+switch ($Menu) {
+
+    "1" {
+        $Global:RepairMode = 1
+    }
+
+    "2" {
+        $Global:RepairMode = 2
+    }
+
+    "3" {
+        $Global:RepairMode = 3
+    }
+
+    "0" {
+        exit
+    }
+
+    default {
+
+        Write-Host "Opção inválida." -ForegroundColor Red
+
+        exit 1
+    }
+}
+
+Write-Log "Outlook Freeze Diagnostic & Repair iniciado." "INFO"
+Write-Log "Versão: $ScriptVersion"
+Write-Log "Modo selecionado: $Global:RepairMode"
+Write-Log "Computador: $env:COMPUTERNAME"
+Write-Log "Usuário: $env:USERNAME"
+Write-Log "Log: $LogFile"
+
+# ============================================================
+# SISTEMA
+# ============================================================
+
+Write-Section "1. INFORMAÇÕES DO SISTEMA"
+
+$OS = Get-CimInstance Win32_OperatingSystem
+
+$ComputerName = $env:COMPUTERNAME
+
+$WindowsName = $OS.Caption
+
+$WindowsBuild = $OS.BuildNumber
+
+$Architecture = $OS.OSArchitecture
+
+$LastBoot = $OS.LastBootUpTime
+
+Write-Log "Computador: $ComputerName"
+Write-Log "Windows: $WindowsName"
+Write-Log "Build: $WindowsBuild"
+Write-Log "Arquitetura: $Architecture"
+Write-Log "Último boot: $LastBoot"
+
+# ============================================================
+# CPU
+# ============================================================
+
+Write-Section "2. CPU"
+
+try {
+
+    $CPU = Get-Counter `
+        '\Processor(_Total)\% Processor Time' `
+        -SampleInterval 1 `
+        -MaxSamples 2
+
+    $CPUUsage = [math]::Round(
+        ($CPU.CounterSamples |
+        Select-Object -Last 1).CookedValue,
+        2
+    )
+
+    Write-Log "CPU atual: $CPUUsage %"
+
+    if ($CPUUsage -ge 90) {
+
+        Add-Issue "CPU acima de 90% durante o diagnóstico."
+
+    }
+    elseif ($CPUUsage -ge 75) {
+
+        Add-Warning "CPU acima de 75%."
+
+    }
+    else {
+
+        Add-Success "CPU dentro de níveis normais."
+    }
+
+}
+catch {
+
+    Add-Warning "Não foi possível obter utilização da CPU."
+}
+
+# ============================================================
+# RAM
+# ============================================================
+
+Write-Section "3. MEMÓRIA RAM"
+
+$TotalRAM = [math]::Round(
+    $OS.TotalVisibleMemorySize / 1MB,
+    2
+)
+
+$FreeRAM = [math]::Round(
+    $OS.FreePhysicalMemory / 1MB,
+    2
+)
+
+$UsedRAM = $TotalRAM - $FreeRAM
+
+$RAMPercent = [math]::Round(
+    ($UsedRAM / $TotalRAM) * 100,
+    2
+)
+
+Write-Log "RAM total: $TotalRAM GB"
+Write-Log "RAM livre: $FreeRAM GB"
+Write-Log "RAM utilizada: $RAMPercent %"
+
+if ($RAMPercent -ge 90) {
+
+    Add-Issue "Memória RAM acima de 90%."
+
+}
+elseif ($RAMPercent -ge 80) {
+
+    Add-Warning "Memória RAM acima de 80%."
+
+}
+else {
+
+    Add-Success "Memória RAM dentro de níveis normais."
+}
+
+# ============================================================
+# DISCO
+# ============================================================
+
+Write-Section "4. DISCO C:"
+
+$Disk = Get-CimInstance Win32_LogicalDisk `
+    -Filter "DeviceID='C:'"
+
+$DiskTotal = [math]::Round(
+    $Disk.Size / 1GB,
+    2
+)
+
+$DiskFree = [math]::Round(
+    $Disk.FreeSpace / 1GB,
+    2
+)
+
+$DiskPercent = [math]::Round(
+    (($DiskTotal - $DiskFree) / $DiskTotal) * 100,
+    2
+)
+
+Write-Log "Capacidade: $DiskTotal GB"
+Write-Log "Livre: $DiskFree GB"
+Write-Log "Utilização: $DiskPercent %"
+
+if ($DiskFree -lt 10) {
+
+    Add-Issue "Menos de 10 GB livres no disco C:."
+
+}
+elseif ($DiskFree -lt 20) {
+
+    Add-Warning "Menos de 20 GB livres no disco C:."
+
+}
+else {
+
+    Add-Success "Espaço em disco adequado."
+}
+
+# ============================================================
+# OUTLOOK
+# ============================================================
+
+Write-Section "5. PROCESSO OUTLOOK"
+
+$OutlookProcesses = Get-Process OUTLOOK `
+    -ErrorAction SilentlyContinue
+
+if ($OutlookProcesses) {
+
+    $Global:OutlookWasRunning = $true
+
+    Add-Success "Outlook está em execução."
+
+    foreach ($Process in $OutlookProcesses) {
+
+        $RAMMB = [math]::Round(
+            $Process.WorkingSet64 / 1MB,
+            2
+        )
+
+        Write-Log "PID: $($Process.Id)"
+        Write-Log "Memória: $RAMMB MB"
+
+        if ($RAMMB -ge 3000) {
+
+            Add-Issue "Outlook utilizando mais de 3 GB de RAM."
+
+        }
+        elseif ($RAMMB -ge 2000) {
+
+            Add-Warning "Outlook utilizando mais de 2 GB de RAM."
+        }
+    }
+
+}
+else {
+
+    Add-Warning "Outlook não está em execução."
+}
+
+# ============================================================
+# ADD-INS
+# ============================================================
+
+Write-Section "6. ADD-INS DO OUTLOOK"
+
+$AddinPaths = @(
+    "HKCU:\Software\Microsoft\Office\Outlook\Addins",
+    "HKLM:\Software\Microsoft\Office\Outlook\Addins",
+    "HKLM:\Software\WOW6432Node\Microsoft\Office\Outlook\Addins"
+)
+
+$Addins = @()
+
+foreach ($Path in $AddinPaths) {
+
+    if (Test-Path $Path) {
+
+        $Items = Get-ChildItem $Path
+
+        foreach ($Item in $Items) {
+
+            $Properties = Get-ItemProperty `
+                $Item.PSPath
+
+            $Name = $Item.PSChildName
+
+            $LoadBehavior = $Properties.LoadBehavior
+
+            $Addins += [PSCustomObject]@{
+
+                Name = $Name
+                LoadBehavior = $LoadBehavior
+                Path = $Path
+            }
+
+            Write-Log "Add-in: $Name"
+            Write-Log "LoadBehavior: $LoadBehavior"
+        }
+    }
+}
+
+if ($Addins.Count -eq 0) {
+
+    Add-Success "Nenhum Add-in COM detectado."
+
+}
+else {
+
+    Add-Warning "$($Addins.Count) Add-in(s) encontrados."
+
+    foreach ($Addin in $Addins) {
+
+        if ($Addin.LoadBehavior -eq 3) {
+
+            Write-Log "Add-in carregado automaticamente: $($Addin.Name)"
+        }
+    }
+}
+
+# ============================================================
+# OFFICE
+# ============================================================
+
+Write-Section "7. MICROSOFT OFFICE / MICROSOFT 365"
+
+$OfficeInstalled = $false
+
+$OfficeRegistryPaths = @(
+    "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun\Configuration"
+)
+
+foreach ($Path in $OfficeRegistryPaths) {
+
+    if (Test-Path $Path) {
+
+        $OfficeInstalled = $true
+
+        $OfficeConfig = Get-ItemProperty $Path
+
+        Write-Log "Microsoft 365 / Click-to-Run detectado." "OK"
+
+        if ($OfficeConfig.VersionToReport) {
+
+            Write-Log "Versão: $($OfficeConfig.VersionToReport)"
+        }
+
+        if ($OfficeConfig.ProductReleaseIds) {
+
+            Write-Log "Produto: $($OfficeConfig.ProductReleaseIds)"
+        }
+    }
+}
+
+if (-not $OfficeInstalled) {
+
+    Add-Warning "Microsoft 365 Click-to-Run não detectado."
+}
+
+# ============================================================
+# WEBVIEW2
+# ============================================================
+
+Write-Section "8. MICROSOFT EDGE WEBVIEW2"
+
+$WebViewRegistry = @(
+    "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients"
+)
+
+$WebViewFound = $false
+
+foreach ($Path in $WebViewRegistry) {
+
+    if (Test-Path $Path) {
+
+        $Clients = Get-ChildItem $Path
+
+        foreach ($Client in $Clients) {
+
+            $Properties = Get-ItemProperty $Client.PSPath
+
+            if (
+                $Properties.name -match
+                "WebView2"
+            ) {
+
+                $WebViewFound = $true
+
+                Write-Log "WebView2 detectado."
+                Write-Log "Versão: $($Properties.pv)"
+            }
+        }
+    }
+}
+
+if ($WebViewFound) {
+
+    Add-Success "Microsoft Edge WebView2 detectado."
+
+}
+else {
+
+    Add-Issue "Microsoft Edge WebView2 não foi detectado."
+}
+
+# ============================================================
+# OST / PST
+# ============================================================
+
+Write-Section "9. ARQUIVOS OST / PST"
+
+$OutlookPaths = @(
+    "$env:LOCALAPPDATA\Microsoft\Outlook",
+    "$env:USERPROFILE\Documents\Outlook Files"
+)
+
+$DataFiles = @()
+
+foreach ($Path in $OutlookPaths) {
+
+    if (Test-Path $Path) {
+
+        $Files = Get-ChildItem `
+            -Path $Path `
+            -Recurse `
+            -Include *.ost,*.pst `
+            -File
+
+        foreach ($File in $Files) {
+
+            $SizeGB = [math]::Round(
+                $File.Length / 1GB,
+                2
+            )
+
+            $DataFiles += [PSCustomObject]@{
+
+                Name = $File.Name
+                Path = $File.FullName
+                SizeGB = $SizeGB
+            }
+
+            Write-Log "$($File.Name) | $SizeGB GB"
+
+            if ($SizeGB -ge 20) {
+
+                Add-Warning `
+                    "Arquivo de dados grande: $($File.Name) ($SizeGB GB)."
+            }
+        }
+    }
+}
+
+if ($DataFiles.Count -eq 0) {
+
+    Add-Warning "Nenhum OST/PST encontrado nos caminhos padrão."
+
+}
+else {
+
+    Add-Success "$($DataFiles.Count) arquivo(s) OST/PST encontrado(s)."
+}
+
+# ============================================================
+# CACHE
+# ============================================================
+
+Write-Section "10. CACHE DO OUTLOOK"
+
+$OutlookCachePath =
+    "$env:LOCALAPPDATA\Microsoft\Outlook"
+
+if (Test-Path $OutlookCachePath) {
+
+    try {
+
+        $CacheSize = (
+            Get-ChildItem `
+                $OutlookCachePath `
+                -Recurse `
+                -File |
+            Measure-Object Length -Sum
+        ).Sum
+
+        $CacheGB = [math]::Round(
+            $CacheSize / 1GB,
+            2
+        )
+
+        Write-Log "Tamanho do diretório: $CacheGB GB"
+
+        Add-Success "Cache do Outlook analisado."
+
+    }
+    catch {
+
+        Add-Warning "Não foi possível calcular o cache."
+    }
+}
+
+# ============================================================
+# CONECTIVIDADE
+# ============================================================
+
+Write-Section "11. CONECTIVIDADE MICROSOFT 365"
+
+$Servers = @(
+    "outlook.office365.com",
+    "login.microsoftonline.com",
+    "www.office.com"
+)
+
+foreach ($Server in $Servers) {
+
+    try {
+
+        $Result = Test-NetConnection `
+            -ComputerName $Server `
+            -Port 443 `
+            -WarningAction SilentlyContinue
+
+        if ($Result.TcpTestSucceeded) {
+
+            Write-Log "$Server : HTTPS OK" "OK"
+
+        }
+        else {
+
+            Add-Issue "$Server : conexão HTTPS falhou."
+        }
+
+    }
+    catch {
+
+        Add-Warning "Falha ao testar $Server."
+    }
+}
+
+# ============================================================
+# DNS
+# ============================================================
+
+Write-Section "12. DNS"
+
+try {
+
+    Resolve-DnsName outlook.office365.com `
+        -ErrorAction Stop | Out-Null
+
+    Add-Success "Resolução DNS funcionando."
+
+}
+catch {
+
+    Add-Issue "Falha na resolução DNS de Outlook/Office 365."
+}
+
+# ============================================================
+# CREDENCIAIS / KERBEROS
+# ============================================================
+
+Write-Section "13. AUTENTICAÇÃO"
+
+try {
+
+    $Tickets = klist
+
+    if ($Tickets) {
+
+        Add-Success "Tickets Kerberos disponíveis."
+    }
+
+}
+catch {
+
+    Add-Warning "Não foi possível analisar tickets Kerberos."
+}
+
+# ============================================================
+# EVENTOS
+# ============================================================
+
+Write-Section "14. EVENT VIEWER"
+
+$StartDate = (Get-Date).AddDays(-7)
+
+try {
+
+    $Events = Get-WinEvent `
+        -FilterHashtable @{
+            LogName = "Application"
+            StartTime = $StartDate
+        } `
+        -ErrorAction SilentlyContinue |
+        Where-Object {
+
+            $_.ProviderName -match `
+            "Outlook|Office|Microsoft Office|Application Error"
+
+        } |
+        Select-Object -First 30
+
+    if ($Events) {
+
+        Add-Warning `
+            "$($Events.Count) evento(s) relacionados encontrados."
+
+        foreach ($Event in $Events) {
+
+            Write-Log "Data: $($Event.TimeCreated)"
+            Write-Log "Fonte: $($Event.ProviderName)"
+            Write-Log "ID: $($Event.Id)"
+            Write-Log "Mensagem: $($Event.Message)"
+            Write-Log "--------------------------------------------------"
+        }
+
+    }
+    else {
+
+        Add-Success `
+            "Nenhum evento relevante encontrado nos últimos 7 dias."
+    }
+
+}
+catch {
+
+    Add-Warning "Não foi possível analisar Event Viewer."
+}
+
+# ============================================================
+# PLANO DE ENERGIA
+# ============================================================
+
+Write-Section "15. PLANO DE ENERGIA"
+
+try {
+
+    $PowerPlan = powercfg /GETACTIVESCHEME
+
+    Write-Log $PowerPlan
+
+    Add-Success "Plano de energia identificado."
+
+}
+catch {
+
+    Add-Warning "Não foi possível identificar o plano de energia."
+}
+
+# ============================================================
+# REPARAÇÃO SEGURA
+# ============================================================
+
+if ($Global:RepairMode -ge 2) {
+
+    Write-Section "16. REPARAÇÃO SEGURA"
+
+    # --------------------------------------------------------
+    # TEMP
+    # --------------------------------------------------------
+
+    Add-Action "Limpando arquivos temporários."
+
+    $TempFolders = @(
+        $env:TEMP,
+        "$env:LOCALAPPDATA\Temp"
+    )
+
+    foreach ($Temp in $TempFolders) {
+
+        if (Test-Path $Temp) {
+
+            Get-ChildItem $Temp `
+                -Force `
+                -ErrorAction SilentlyContinue |
+                Remove-Item `
+                    -Recurse `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+        }
+    }
+
+    Add-Success "Arquivos temporários processados."
+
+    # --------------------------------------------------------
+    # DNS
+    # --------------------------------------------------------
+
+    Add-Action "Limpando cache DNS."
+
+    ipconfig /flushdns | Out-Null
+
+    Add-Success "Cache DNS limpo."
+
+    # --------------------------------------------------------
+    # OUTLOOK
+    # --------------------------------------------------------
+
+    if ($Global:OutlookWasRunning) {
+
+        Write-Host ""
+        Write-Host "O Outlook está aberto." -ForegroundColor Yellow
+
+        $CloseOutlook = Read-Host `
+            "Deseja fechar o Outlook para aplicar reparações? (S/N)"
+
+        if ($CloseOutlook -match "^[Ss]$") {
+
+            Add-Action "Encerrando Outlook."
+
+            Stop-Process `
+                -Name OUTLOOK `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+            Start-Sleep -Seconds 3
+
+            Add-Success "Outlook encerrado."
+
+        }
+        else {
+
+            Add-Warning `
+                "Outlook permaneceu aberto. Algumas correções foram ignoradas."
+        }
+    }
+
+    # --------------------------------------------------------
+    # OFFICE SERVICES
+    # --------------------------------------------------------
+
+    Add-Action "Verificando serviços do Microsoft Office."
+
+    $OfficeServices = @(
+        "ClickToRunSvc"
+    )
+
+    foreach ($ServiceName in $OfficeServices) {
+
+        $Service = Get-Service `
+            -Name $ServiceName `
+            -ErrorAction SilentlyContinue
+
+        if ($Service) {
+
+            Write-Log `
+                "$ServiceName : $($Service.Status)"
+
+            if (
+                $Service.Status -ne "Running"
+            ) {
+
+                try {
+
+                    Start-Service `
+                        -Name $ServiceName `
+                        -ErrorAction Stop
+
+                    Add-Success `
+                        "$ServiceName iniciado."
+
+                }
+                catch {
+
+                    Add-Warning `
+                        "Não foi possível iniciar $ServiceName."
+                }
+            }
+        }
+    }
+
+    # --------------------------------------------------------
+    # SFC CHECK
+    # --------------------------------------------------------
+
+    Add-Action "Executando verificação SFC."
+
+    $SFCOutput = sfc /verifyonly 2>&1
+
+    $SFCOutput |
+        Add-Content -Path $LogFile
+
+    Add-Success "Verificação SFC concluída."
+
+    # --------------------------------------------------------
+    # DISM CHECK
+    # --------------------------------------------------------
+
+    Add-Action "Executando DISM CheckHealth."
+
+    $DISMOutput = DISM `
+        /Online `
+        /Cleanup-Image `
+        /CheckHealth `
+        2>&1
+
+    $DISMOutput |
+        Add-Content -Path $LogFile
+
+    Add-Success "DISM CheckHealth concluído."
+}
+
+# ============================================================
+# REPARAÇÃO AVANÇADA
+# ============================================================
+
+if ($Global:RepairMode -eq 3) {
+
+    Write-Section "17. REPARAÇÃO AVANÇADA"
+
+    Write-Host ""
+    Write-Host "Atenção:" -ForegroundColor Yellow
+    Write-Host "A reparação avançada pode alterar componentes do Office."
+    Write-Host "Nenhum OST/PST será apagado automaticamente."
+    Write-Host ""
+
+    $AdvancedConfirm = Read-Host `
+        "Deseja continuar com a reparação avançada? (S/N)"
+
+    if ($AdvancedConfirm -match "^[Ss]$") {
+
+        # ----------------------------------------------------
+        # OFFICE REPAIR
+        # ----------------------------------------------------
+
+        $OfficeClickToRun = @(
+            "$env:ProgramFiles\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe",
+            "${env:ProgramFiles(x86)}\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe"
+        )
+
+        $C2R = $null
+
+        foreach ($Path in $OfficeClickToRun) {
+
+            if (Test-Path $Path) {
+
+                $C2R = $Path
+                break
+            }
+        }
+
+        if ($C2R) {
+
+            Write-Host ""
+            Write-Host "Microsoft 365 Click-to-Run detectado." -ForegroundColor Green
+            Write-Host ""
+
+            Write-Host "[1] Reparação rápida"
+            Write-Host "[2] Reparação online"
+            Write-Host "[0] Cancelar"
+
+            $RepairChoice = Read-Host "Escolha"
+
+            switch ($RepairChoice) {
+
+                "1" {
+
+                    Add-Action "Iniciando reparação rápida do Office."
+
+                    Start-Process `
+                        -FilePath $C2R `
+                        -ArgumentList `
+                        "/update user displaylevel=true forceappshutdown=true" `
+                        -Wait `
+                        -ErrorAction SilentlyContinue
+
+                    Add-Success `
+                        "Processo de reparação/atualização iniciado."
+                }
+
+                "2" {
+
+                    Add-Action "Iniciando reparação online do Office."
+
+                    Start-Process `
+                        -FilePath $C2R `
+                        -ArgumentList `
+                        "/update user displaylevel=true forceappshutdown=true" `
+                        -Wait `
+                        -ErrorAction SilentlyContinue
+
+                    Add-Success `
+                        "Processo de atualização/reparação iniciado."
+                }
+
+                default {
+
+                    Add-Warning `
+                        "Reparação do Office cancelada."
+                }
+            }
+
+        }
+        else {
+
+            Add-Warning `
+                "OfficeC2RClient.exe não encontrado."
+        }
+
+        # ----------------------------------------------------
+        # DISM RESTOREHEALTH
+        # ----------------------------------------------------
+
+        $DISMConfirm = Read-Host `
+            "Deseja executar DISM RestoreHealth? (S/N)"
+
+        if ($DISMConfirm -match "^[Ss]$") {
+
+            Add-Action `
+                "Executando DISM RestoreHealth."
+
+            DISM `
+                /Online `
+                /Cleanup-Image `
+                /RestoreHealth `
+                2>&1 |
+                Add-Content -Path $LogFile
+
+            Add-Success `
+                "DISM RestoreHealth concluído."
+        }
+
+        # ----------------------------------------------------
+        # SFC
+        # ----------------------------------------------------
+
+        $SFCConfirm = Read-Host `
+            "Deseja executar SFC /scannow? (S/N)"
+
+        if ($SFCConfirm -match "^[Ss]$") {
+
+            Add-Action `
+                "Executando SFC /scannow."
+
+            sfc /scannow 2>&1 |
+                Add-Content -Path $LogFile
+
+            Add-Success `
+                "SFC /scannow concluído."
+        }
+
+    }
+    else {
+
+        Add-Warning `
+            "Reparação avançada cancelada pelo usuário."
+    }
+}
+
+# ============================================================
+# DIAGNÓSTICO INTELIGENTE
+# ============================================================
+
+Write-Section "18. ANÁLISE INTELIGENTE"
+
+$PossibleCauses = New-Object System.Collections.ArrayList
+
+if ($RAMPercent -ge 90) {
+
+    [void]$PossibleCauses.Add(
+        "Memória RAM elevada."
+    )
+}
+
+if ($CPUUsage -ge 90) {
+
+    [void]$PossibleCauses.Add(
+        "CPU elevada."
+    )
+}
+
+if ($DiskFree -lt 10) {
+
+    [void]$PossibleCauses.Add(
+        "Pouco espaço disponível no disco."
+    )
+}
+
+if ($DataFiles | Where-Object { $_.SizeGB -ge 20 }) {
+
+    [void]$PossibleCauses.Add(
+        "OST/PST com tamanho elevado."
+    )
+}
+
+if ($Addins.Count -gt 0) {
+
+    [void]$PossibleCauses.Add(
+        "Add-ins do Outlook instalados."
+    )
+}
+
+if (-not $WebViewFound) {
+
+    [void]$PossibleCauses.Add(
+        "Microsoft Edge WebView2 não detectado."
+    )
+}
+
+if ($Events.Count -gt 0) {
+
+    [void]$PossibleCauses.Add(
+        "Eventos relacionados ao Outlook/Office encontrados."
+    )
+}
+
+if ($PossibleCauses.Count -eq 0) {
+
+    Add-Success `
+        "Nenhuma causa óbvia identificada."
+
+}
+else {
+
+    foreach ($Cause in $PossibleCauses) {
+
+        Write-Log "Possível causa: $Cause" "WARNING"
+    }
+}
+
+# ============================================================
+# CLASSIFICAÇÃO
+# ============================================================
+
+$TotalIssues = $Issues.Count
+
+$TotalWarnings = $Warnings.Count
+
+if ($TotalIssues -eq 0 -and $TotalWarnings -eq 0) {
+
+    $FinalStatus = "OK"
+
+}
+elseif ($TotalIssues -eq 0) {
+
+    $FinalStatus = "ATENÇÃO"
+
+}
+else {
+
+    $FinalStatus = "PROBLEMAS ENCONTRADOS"
+}
+
+# ============================================================
+# RELATÓRIO HTML
+# ============================================================
+
+Write-Section "19. GERANDO RELATÓRIO HTML"
+
+$IssueRows = ""
+
+foreach ($Issue in $Issues) {
+
+    $IssueRows += @"
+<tr>
+<td class="critical">CRÍTICO</td>
+<td>$Issue</td>
+</tr>
+"@
+}
+
+$WarningRows = ""
+
+foreach ($Warning in $Warnings) {
+
+    $WarningRows += @"
+<tr>
+<td class="warning">ATENÇÃO</td>
+<td>$Warning</td>
+</tr>
+"@
+}
+
+$SuccessRows = ""
+
+foreach ($Success in $Successes) {
+
+    $SuccessRows += @"
+<tr>
+<td class="success">OK</td>
+<td>$Success</td>
+</tr>
+"@
+}
+
+$CauseRows = ""
+
+foreach ($Cause in $PossibleCauses) {
+
+    $CauseRows += @"
+<li>$Cause</li>
+"@
+}
+
+$HTML = @"
+<!DOCTYPE html>
+
+<html lang="pt">
+
+<head>
+
+<meta charset="UTF-8">
+
+<title>Outlook Freeze Diagnostic & Repair</title>
+
+<style>
+
+body {
+    font-family: Arial, sans-serif;
+    background: #f4f6f8;
+    color: #222;
+    margin: 40px;
+}
+
+.header {
+    background: #1f2937;
+    color: white;
+    padding: 25px;
+    border-radius: 10px;
+}
+
+h1 {
+    margin: 0;
+}
+
+.card {
+    background: white;
+    padding: 20px;
+    margin-top: 20px;
+    border-radius: 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th, td {
+    padding: 12px;
+    border-bottom: 1px solid #ddd;
+    text-align: left;
+}
+
+th {
+    background: #e5e7eb;
+}
+
+.success {
+    color: #15803d;
+    font-weight: bold;
+}
+
+.warning {
+    color: #ca8a04;
+    font-weight: bold;
+}
+
+.critical {
+    color: #dc2626;
+    font-weight: bold;
+}
+
+.status {
+    font-size: 24px;
+    font-weight: bold;
+}
+
+.footer {
+    margin-top: 30px;
+    color: #666;
+    font-size: 13px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="header">
+
+<h1>Outlook Freeze Diagnostic & Repair</h1>
+
+<p>Versão $ScriptVersion</p>
+
+<p>Computador: $ComputerName</p>
+
+<p>Data: $(Get-Date)</p>
+
+<p class="status">
+Status final: $FinalStatus
+</p>
+
+</div>
+
+<div class="card">
+
+<h2>Resumo</h2>
+
+<p>
+Problemas críticos: $TotalIssues
+</p>
+
+<p>
+Alertas: $TotalWarnings
+</p>
+
+<p>
+Itens OK: $($Successes.Count)
+</p>
+
+</div>
+
+<div class="card">
+
+<h2>Possíveis causas</h2>
+
+<ul>
+
+$CauseRows
+
+</ul>
+
+</div>
+
+<div class="card">
+
+<h2>Problemas encontrados</h2>
+
+<table>
+
+<tr>
+<th>Status</th>
+<th>Descrição</th>
+</tr>
+
+$IssueRows
+$WarningRows
+$SuccessRows
+
+</table>
+
+</div>
+
+<div class="card">
+
+<h2>Informações do sistema</h2>
+
+<table>
+
+<tr>
+<td>Computador</td>
+<td>$ComputerName</td>
+</tr>
+
+<tr>
+<td>Windows</td>
+<td>$WindowsName</td>
+</tr>
+
+<tr>
+<td>Build</td>
+<td>$WindowsBuild</td>
+</tr>
+
+<tr>
+<td>RAM</td>
+<td>$TotalRAM GB</td>
+</tr>
+
+<tr>
+<td>RAM utilizada</td>
+<td>$RAMPercent %</td>
+</tr>
+
+<tr>
+<td>Disco livre</td>
+<td>$DiskFree GB</td>
+</tr>
+
+<tr>
+<td>CPU</td>
+<td>$CPUUsage %</td>
+</tr>
+
+</table>
+
+</div>
+
+<div class="card">
+
+<h2>Arquivos de dados</h2>
+
+<table>
+
+<tr>
+<th>Arquivo</th>
+<th>Tamanho</th>
+</tr>
+
+$(
+foreach ($File in $DataFiles) {
+
+    "<tr><td>$($File.Name)</td><td>$($File.SizeGB) GB</td></tr>"
+}
+
+)
+
+</table>
+
+</div>
+
+<div class="card">
+
+<h2>Recomendações</h2>
+
+<ul>
+
+<li>Testar o Outlook em modo seguro caso o problema persista.</li>
+
+<li>Verificar Add-ins que carregam automaticamente.</li>
+
+<li>Confirmar integridade do Microsoft 365.</li>
+
+<li>Verificar tamanho dos arquivos OST/PST.</li>
+
+<li>Verificar eventos do Windows relacionados ao Outlook.</li>
+
+<li>Evitar apagar OST/PST sem diagnóstico adicional.</li>
+
+</ul>
+
+</div>
+
+<div class="footer">
+
+Outlook Freeze Diagnostic & Repair v$ScriptVersion
+
+<br>
+
+Log: $LogFile
+
+</div>
+
+</body>
+
+</html>
+"@
+
+$HTML | Out-File `
+    -FilePath $ReportFile `
+    -Encoding UTF8
+
+Add-Success `
+    "Relatório HTML criado: $ReportFile"
+
+# ============================================================
+# FINAL
+# ============================================================
+
+Write-Section "20. RESULTADO FINAL"
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host "              DIAGNÓSTICO CONCLUÍDO" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host ""
+
+Write-Host "Status: " -NoNewline
+
+switch ($FinalStatus) {
+
+    "OK" {
+        Write-Host $FinalStatus -ForegroundColor Green
+    }
+
+    "ATENÇÃO" {
+        Write-Host $FinalStatus -ForegroundColor Yellow
+    }
+
+    default {
+        Write-Host $FinalStatus -ForegroundColor Red
+    }
+}
+
+Write-Host ""
+
+Write-Host "Problemas encontrados: $TotalIssues" -ForegroundColor Red
+Write-Host "Alertas: $TotalWarnings" -ForegroundColor Yellow
+Write-Host "Itens OK: $($Successes.Count)" -ForegroundColor Green
+
+Write-Host ""
+
+Write-Host "LOG:" -ForegroundColor Cyan
+Write-Host $LogFile
+
+Write-Host ""
+
+Write-Host "RELATÓRIO HTML:" -ForegroundColor Cyan
+Write-Host $ReportFile
+
+Write-Host ""
+
+Write-Host "============================================================" -ForegroundColor Green
+
+# ============================================================
+# ABRIR RELATÓRIO
+# ============================================================
+
+$OpenReport = Read-Host `
+    "Deseja abrir o relatório HTML agora? (S/N)"
+
+if ($OpenReport -match "^[Ss]$") {
+
+    Start-Process `
+        $ReportFile `
+        -ErrorAction SilentlyContinue
+}
+
+Write-Log "Script finalizado."
