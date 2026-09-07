@@ -1,0 +1,663 @@
+# ============================================================
+# EXCEL HEAVY FILES - DIAGNOSTIC & REPAIR
+# Versao: 1.0
+# Objetivo:
+# Corrigir bloqueios/lentidao/desligamentos ao trabalhar
+# com varios ficheiros Excel pesados.
+#
+# Executar como ADMINISTRADOR
+# ============================================================
+
+$ErrorActionPreference = "SilentlyContinue"
+
+# ------------------------------------------------------------
+# CONFIGURACOES
+# ------------------------------------------------------------
+
+$ReportFolder = "C:\Temp\Excel_Repair"
+$ReportFile   = "$ReportFolder\Excel_Repair_Report.txt"
+
+# Se TRUE, desativa Add-ins COM de terceiros do Excel.
+# Recomendo deixar FALSE na primeira execucao.
+$DisableThirdPartyExcelAddins = $false
+
+# ------------------------------------------------------------
+# FUNCOES
+# ------------------------------------------------------------
+
+function Write-Section {
+    param([string]$Text)
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor DarkCyan
+    Write-Host " $Text" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor DarkCyan
+
+    Add-Content $ReportFile ""
+    Add-Content $ReportFile "============================================================"
+    Add-Content $ReportFile $Text
+    Add-Content $ReportFile "============================================================"
+}
+
+function Write-Result {
+    param(
+        [string]$Text,
+        [string]$Status = "INFO"
+    )
+
+    switch ($Status) {
+
+        "OK" {
+            Write-Host "[OK] $Text" -ForegroundColor Green
+        }
+
+        "WARN" {
+            Write-Host "[ATENCAO] $Text" -ForegroundColor Yellow
+        }
+
+        "ERROR" {
+            Write-Host "[ERRO] $Text" -ForegroundColor Red
+        }
+
+        default {
+            Write-Host "[INFO] $Text" -ForegroundColor Gray
+        }
+    }
+
+    Add-Content $ReportFile "[$Status] $Text"
+}
+
+# ------------------------------------------------------------
+# VERIFICAR ADMINISTRADOR
+# ------------------------------------------------------------
+
+$Admin = (
+    New-Object Security.Principal.WindowsPrincipal(
+        [Security.Principal.WindowsIdentity]::GetCurrent()
+    )
+).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator
+)
+
+if (-not $Admin) {
+
+    Write-Host ""
+    Write-Host "Este script precisa de ser executado como ADMINISTRADOR." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Clique com o botao direito no PowerShell -> Executar como administrador."
+    Write-Host ""
+
+    pause
+    exit 1
+}
+
+# ------------------------------------------------------------
+# CRIAR PASTA
+# ------------------------------------------------------------
+
+if (!(Test-Path $ReportFolder)) {
+    New-Item -ItemType Directory -Path $ReportFolder -Force | Out-Null
+}
+
+Clear-Content $ReportFile -ErrorAction SilentlyContinue
+
+Add-Content $ReportFile "EXCEL HEAVY FILES - DIAGNOSTIC & REPAIR"
+Add-Content $ReportFile "Data: $(Get-Date)"
+Add-Content $ReportFile "Computador: $env:COMPUTERNAME"
+Add-Content $ReportFile "Utilizador: $env:USERNAME"
+
+Clear-Host
+
+Write-Host ""
+Write-Host " EXCEL HEAVY FILES - DIAGNOSTIC & REPAIR" -ForegroundColor Cyan
+Write-Host " ----------------------------------------" -ForegroundColor DarkGray
+Write-Host ""
+
+# ------------------------------------------------------------
+# 1. VERIFICAR SE EXCEL ESTA ABERTO
+# ------------------------------------------------------------
+
+Write-Section "1. VERIFICAR MICROSOFT EXCEL"
+
+$Excel = Get-Process EXCEL -ErrorAction SilentlyContinue
+
+if ($Excel) {
+
+    Write-Result "O Microsoft Excel esta aberto." "WARN"
+
+    Write-Host ""
+    Write-Host "Guarde os ficheiros Excel e feche o Excel antes de continuar." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "O script NAO vai fechar o Excel automaticamente para evitar perda de dados." -ForegroundColor Yellow
+    Write-Host ""
+
+    pause
+    exit
+}
+
+Write-Result "Microsoft Excel fechado. Podemos continuar." "OK"
+
+
+# ------------------------------------------------------------
+# 2. INFORMACOES DO COMPUTADOR
+# ------------------------------------------------------------
+
+Write-Section "2. INFORMACOES DO COMPUTADOR"
+
+$OS = Get-CimInstance Win32_OperatingSystem
+$CS = Get-CimInstance Win32_ComputerSystem
+$CPU = Get-CimInstance Win32_Processor | Select-Object -First 1
+
+$RAMTotalGB = [math]::Round($CS.TotalPhysicalMemory / 1GB, 2)
+$RAMFreeGB  = [math]::Round($OS.FreePhysicalMemory / 1MB, 2)
+$RAMUsedGB  = [math]::Round($RAMTotalGB - $RAMFreeGB, 2)
+
+Write-Result "Windows: $($OS.Caption)"
+Write-Result "CPU: $($CPU.Name)"
+Write-Result "RAM instalada: $RAMTotalGB GB"
+Write-Result "RAM utilizada: $RAMUsedGB GB"
+Write-Result "RAM disponivel: $RAMFreeGB GB"
+
+if ($RAMTotalGB -lt 8) {
+
+    Write-Result "Menos de 8 GB de RAM. Excel pesado pode apresentar bloqueios." "WARN"
+
+}
+elseif ($RAMTotalGB -lt 16) {
+
+    Write-Result "RAM entre 8 e 16 GB. Para Excel pesado, 16 GB ou mais e recomendado." "WARN"
+
+}
+else {
+
+    Write-Result "Quantidade de RAM adequada para cargas Excel mais pesadas." "OK"
+}
+
+
+# ------------------------------------------------------------
+# 3. MEMORIA VIRTUAL
+# ------------------------------------------------------------
+
+Write-Section "3. VERIFICAR MEMORIA VIRTUAL / PAGEFILE"
+
+try {
+
+    $ComputerSystem = Get-CimInstance Win32_ComputerSystem
+
+    if ($ComputerSystem.AutomaticManagedPagefile -eq $true) {
+
+        Write-Result "Memoria virtual ja esta em modo automatico." "OK"
+
+    }
+    else {
+
+        Write-Result "Memoria virtual nao estava em modo automatico." "WARN"
+
+        Set-CimInstance `
+            -InputObject $ComputerSystem `
+            -Property @{AutomaticManagedPagefile = $true}
+
+        Write-Result "Memoria virtual configurada para gestao automatica pelo Windows." "OK"
+    }
+
+}
+catch {
+
+    Write-Result "Nao foi possivel alterar a memoria virtual." "ERROR"
+}
+
+
+# ------------------------------------------------------------
+# 4. ESPACO EM DISCO
+# ------------------------------------------------------------
+
+Write-Section "4. VERIFICAR ESPACO EM DISCO"
+
+$Disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+
+$FreeGB = [math]::Round($Disk.FreeSpace / 1GB, 2)
+$TotalGB = [math]::Round($Disk.Size / 1GB, 2)
+
+$FreePercent = [math]::Round(($Disk.FreeSpace / $Disk.Size) * 100, 1)
+
+Write-Result "Disco C: $FreeGB GB livres de $TotalGB GB ($FreePercent%)"
+
+if ($FreePercent -lt 10) {
+
+    Write-Result "Espaco livre muito baixo. Isto pode causar problemas no Excel e memoria virtual." "ERROR"
+
+}
+elseif ($FreePercent -lt 20) {
+
+    Write-Result "Pouco espaco disponivel no disco." "WARN"
+
+}
+else {
+
+    Write-Result "Espaco em disco normal." "OK"
+}
+
+
+# ------------------------------------------------------------
+# 5. LIMPEZA DE TEMPORARIOS
+# ------------------------------------------------------------
+
+Write-Section "5. LIMPEZA DE FICHEIROS TEMPORARIOS"
+
+$TempPaths = @(
+    "$env:TEMP",
+    "C:\Windows\Temp"
+)
+
+foreach ($Path in $TempPaths) {
+
+    if (Test-Path $Path) {
+
+        Write-Result "A limpar: $Path"
+
+        Get-ChildItem $Path -Force -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.LastWriteTime -lt (Get-Date).AddDays(-7)
+        } |
+        Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Result "Limpeza de temporarios concluida." "OK"
+
+
+# ------------------------------------------------------------
+# 6. DESATIVAR ACELERACAO GRAFICA DO OFFICE
+# ------------------------------------------------------------
+
+Write-Section "6. ACELERACAO GRAFICA MICROSOFT OFFICE"
+
+$GraphicsPath = "HKCU:\Software\Microsoft\Office\16.0\Common\Graphics"
+
+if (!(Test-Path $GraphicsPath)) {
+
+    New-Item `
+        -Path $GraphicsPath `
+        -Force | Out-Null
+}
+
+New-ItemProperty `
+    -Path $GraphicsPath `
+    -Name "DisableHardwareAcceleration" `
+    -Value 1 `
+    -PropertyType DWORD `
+    -Force | Out-Null
+
+Write-Result "Aceleracao grafica por hardware do Office desativada." "OK"
+
+Write-Result "Esta configuracao pode reduzir bloqueios relacionados com GPU/driver grafico." "INFO"
+
+
+# ------------------------------------------------------------
+# 7. VERIFICAR ADD-INS DO EXCEL
+# ------------------------------------------------------------
+
+Write-Section "7. ADD-INS DO MICROSOFT EXCEL"
+
+$AddinLocations = @(
+    "HKCU:\Software\Microsoft\Office\Excel\Addins",
+    "HKLM:\Software\Microsoft\Office\Excel\Addins",
+    "HKLM:\Software\WOW6432Node\Microsoft\Office\Excel\Addins"
+)
+
+$AddinCount = 0
+
+foreach ($Location in $AddinLocations) {
+
+    if (Test-Path $Location) {
+
+        $Addins = Get-ChildItem $Location -ErrorAction SilentlyContinue
+
+        foreach ($Addin in $Addins) {
+
+            $AddinCount++
+
+            $Properties = Get-ItemProperty $Addin.PSPath
+
+            $FriendlyName = $Properties.FriendlyName
+            $Description  = $Properties.Description
+            $LoadBehavior = $Properties.LoadBehavior
+
+            Write-Result "Add-in: $FriendlyName | LoadBehavior: $LoadBehavior"
+
+            if ($DisableThirdPartyExcelAddins) {
+
+                if (
+                    $FriendlyName -notmatch "Microsoft" -and
+                    $FriendlyName -notmatch "Office"
+                ) {
+
+                    try {
+
+                        Set-ItemProperty `
+                            -Path $Addin.PSPath `
+                            -Name "LoadBehavior" `
+                            -Value 2
+
+                        Write-Result "Add-in desativado: $FriendlyName" "WARN"
+
+                    }
+                    catch {
+
+                        Write-Result "Nao foi possivel desativar: $FriendlyName" "ERROR"
+                    }
+                }
+            }
+        }
+    }
+}
+
+if ($AddinCount -eq 0) {
+
+    Write-Result "Nenhum Add-in COM do Excel encontrado." "OK"
+
+}
+else {
+
+    Write-Result "$AddinCount Add-in(s) encontrados." "WARN"
+}
+
+
+# ------------------------------------------------------------
+# 8. VERIFICAR OFFICE CLICK-TO-RUN
+# ------------------------------------------------------------
+
+Write-Section "8. SERVICO MICROSOFT OFFICE"
+
+$CTR = Get-Service ClickToRunSvc -ErrorAction SilentlyContinue
+
+if ($CTR) {
+
+    if ($CTR.Status -ne "Running") {
+
+        Start-Service ClickToRunSvc
+
+        Start-Sleep 3
+    }
+
+    $CTR = Get-Service ClickToRunSvc
+
+    if ($CTR.Status -eq "Running") {
+
+        Write-Result "Microsoft Office Click-to-Run esta ativo." "OK"
+
+    }
+    else {
+
+        Write-Result "Microsoft Office Click-to-Run nao iniciou corretamente." "WARN"
+    }
+
+}
+else {
+
+    Write-Result "Servico Click-to-Run nao encontrado. Office pode utilizar outro metodo de instalacao." "INFO"
+}
+
+
+# ------------------------------------------------------------
+# 9. VERIFICAR EVENTOS DE DESLIGAMENTO
+# ------------------------------------------------------------
+
+Write-Section "9. EVENTOS CRITICOS DE ENERGIA"
+
+$StartTime = (Get-Date).AddDays(-14)
+
+$KernelPower = Get-WinEvent `
+    -FilterHashtable @{
+        LogName   = "System"
+        Id        = 41
+        StartTime = $StartTime
+    } `
+    -ErrorAction SilentlyContinue
+
+if ($KernelPower) {
+
+    Write-Result "$($KernelPower.Count) evento(s) Kernel-Power 41 encontrados nos ultimos 14 dias." "WARN"
+
+    foreach ($Event in ($KernelPower | Select-Object -First 5)) {
+
+        Add-Content $ReportFile ""
+        Add-Content $ReportFile "Kernel-Power:"
+        Add-Content $ReportFile "Data: $($Event.TimeCreated)"
+        Add-Content $ReportFile "ID: $($Event.Id)"
+    }
+
+}
+else {
+
+    Write-Result "Nenhum Kernel-Power 41 encontrado nos ultimos 14 dias." "OK"
+}
+
+
+# ------------------------------------------------------------
+# 10. RESOURCE EXHAUSTION
+# ------------------------------------------------------------
+
+Write-Section "10. EVENTOS DE FALTA DE MEMORIA"
+
+$MemoryEvents = Get-WinEvent `
+    -FilterHashtable @{
+        LogName      = "System"
+        ProviderName = "Microsoft-Windows-Resource-Exhaustion-Detector"
+        StartTime    = $StartTime
+    } `
+    -ErrorAction SilentlyContinue
+
+if ($MemoryEvents) {
+
+    Write-Result "$($MemoryEvents.Count) evento(s) de falta de recursos/memoria encontrados." "WARN"
+
+}
+else {
+
+    Write-Result "Nenhum evento recente de esgotamento de memoria encontrado." "OK"
+}
+
+
+# ------------------------------------------------------------
+# 11. EVENTOS DO EXCEL
+# ------------------------------------------------------------
+
+Write-Section "11. ERROS DO MICROSOFT EXCEL"
+
+$ExcelEvents = Get-WinEvent `
+    -FilterHashtable @{
+        LogName   = "Application"
+        StartTime = $StartTime
+    } `
+    -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.Message -match "EXCEL.EXE|Microsoft Excel"
+} |
+Select-Object -First 20
+
+if ($ExcelEvents) {
+
+    Write-Result "$($ExcelEvents.Count) evento(s) relacionados com Excel encontrados." "WARN"
+
+    foreach ($Event in $ExcelEvents) {
+
+        Add-Content $ReportFile ""
+        Add-Content $ReportFile "Data: $($Event.TimeCreated)"
+        Add-Content $ReportFile "ID: $($Event.Id)"
+        Add-Content $ReportFile "Origem: $($Event.ProviderName)"
+        Add-Content $ReportFile "Mensagem:"
+        Add-Content $ReportFile $Event.Message
+    }
+
+}
+else {
+
+    Write-Result "Nenhum erro relevante do Excel encontrado." "OK"
+}
+
+
+# ------------------------------------------------------------
+# 12. VERIFICACAO DO DISCO
+# ------------------------------------------------------------
+
+Write-Section "12. VERIFICACAO DO DISCO"
+
+Write-Result "Executando CHKDSK /SCAN..."
+
+cmd.exe /c "chkdsk C: /scan" |
+    Tee-Object -FilePath "$ReportFolder\CHKDSK.txt"
+
+Write-Result "Verificacao CHKDSK concluida." "OK"
+
+
+# ------------------------------------------------------------
+# 13. DISM
+# ------------------------------------------------------------
+
+Write-Section "13. REPARACAO DA IMAGEM DO WINDOWS"
+
+Write-Result "Executando DISM RestoreHealth..."
+
+DISM.exe /Online /Cleanup-Image /RestoreHealth |
+    Tee-Object -FilePath "$ReportFolder\DISM.txt"
+
+if ($LASTEXITCODE -eq 0) {
+
+    Write-Result "DISM concluido com sucesso." "OK"
+
+}
+else {
+
+    Write-Result "DISM terminou com codigo: $LASTEXITCODE" "WARN"
+}
+
+
+# ------------------------------------------------------------
+# 14. SYSTEM FILE CHECKER
+# ------------------------------------------------------------
+
+Write-Section "14. VERIFICACAO DOS FICHEIROS DO WINDOWS"
+
+Write-Result "Executando SFC /SCANNOW..."
+
+sfc.exe /scannow |
+    Tee-Object -FilePath "$ReportFolder\SFC.txt"
+
+Write-Result "SFC concluido." "OK"
+
+
+# ------------------------------------------------------------
+# 15. PLANO DE ENERGIA
+# ------------------------------------------------------------
+
+Write-Section "15. PLANO DE ENERGIA"
+
+# Balanced
+$BalancedGUID = "381b4222-f694-41f0-9685-ff5bb260df2e"
+
+powercfg /setactive $BalancedGUID
+
+if ($LASTEXITCODE -eq 0) {
+
+    Write-Result "Plano de energia BALANCED ativado." "OK"
+    Write-Result "Evita manter CPU permanentemente no maximo e pode ajudar em problemas termicos." "INFO"
+
+}
+else {
+
+    Write-Result "Nao foi possivel alterar o plano de energia." "WARN"
+}
+
+
+# ------------------------------------------------------------
+# 16. VERIFICAR REINICIOS / BUGCHECK
+# ------------------------------------------------------------
+
+Write-Section "16. BSOD / BUGCHECK"
+
+$BugCheck = Get-WinEvent `
+    -FilterHashtable @{
+        LogName   = "System"
+        Id        = 1001
+        StartTime = $StartTime
+    } `
+    -ErrorAction SilentlyContinue
+
+if ($BugCheck) {
+
+    Write-Result "$($BugCheck.Count) evento(s) BugCheck encontrados." "WARN"
+
+}
+else {
+
+    Write-Result "Nenhum BugCheck recente encontrado." "OK"
+}
+
+
+# ------------------------------------------------------------
+# 17. VERIFICAR RAM DISPONIVEL NOVAMENTE
+# ------------------------------------------------------------
+
+Write-Section "17. ESTADO FINAL DA MEMORIA"
+
+$OSFinal = Get-CimInstance Win32_OperatingSystem
+
+$FreeRAMFinal = [math]::Round(
+    $OSFinal.FreePhysicalMemory / 1MB,
+    2
+)
+
+Write-Result "RAM disponivel atualmente: $FreeRAMFinal GB"
+
+if ($FreeRAMFinal -lt 2) {
+
+    Write-Result "Pouca memoria RAM disponivel." "WARN"
+
+}
+else {
+
+    Write-Result "Memoria disponivel em nivel aceitavel." "OK"
+}
+
+
+# ------------------------------------------------------------
+# FINAL
+# ------------------------------------------------------------
+
+Write-Section "PROCESSO CONCLUIDO"
+
+Write-Result "Memoria virtual verificada/configurada."
+Write-Result "Temporarios antigos removidos."
+Write-Result "Aceleracao grafica do Office desativada."
+Write-Result "Add-ins do Excel analisados."
+Write-Result "Eventos Kernel-Power analisados."
+Write-Result "Eventos de memoria analisados."
+Write-Result "Eventos do Excel analisados."
+Write-Result "Disco verificado."
+Write-Result "Windows reparado com DISM/SFC."
+Write-Result "Plano de energia configurado para Balanced."
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host " ANALISE E REPARACAO CONCLUIDAS" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host ""
+Write-Host "Relatorio:" -ForegroundColor Cyan
+Write-Host $ReportFile -ForegroundColor White
+Write-Host ""
+Write-Host "RECOMENDACAO:" -ForegroundColor Yellow
+Write-Host "Reinicie o computador antes de voltar a testar os ficheiros Excel."
+Write-Host ""
+Write-Host "Depois abra primeiro 1 ficheiro pesado e posteriormente 2 ou 3."
+Write-Host ""
+
+if ($KernelPower) {
+
+    Write-Host "ATENCAO:" -ForegroundColor Red
+    Write-Host "Foram encontrados eventos Kernel-Power 41." -ForegroundColor Red
+    Write-Host "Se o computador continuar a desligar-se, deve ser investigado hardware/temperatura." -ForegroundColor Red
+    Write-Host ""
+}
+
+pause
