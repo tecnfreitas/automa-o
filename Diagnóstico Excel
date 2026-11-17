@@ -1,0 +1,1036 @@
+
+#requires -Version 5.1
+
+<#
+.SYNOPSIS
+    EXCEL EXPERT DIAGNOSTIC - FULL AUDIT
+
+.DESCRIPTION
+    Analisa todos os livros de trabalho encontrados nas instancias
+    Excel registadas na Running Object Table (ROT).
+
+    Analises:
+      - Erros em formulas
+      - Referencias #REF!
+      - Formulas inconsistentes (heuristica)
+      - Linhas completamente vazias dentro do UsedRange
+      - Folhas ocultas
+      - Nomes definidos com referencias invalidas
+      - Ligacoes externas
+      - Tabelas Excel
+      - Celulas mescladas
+      - Dimensao anormal do UsedRange
+
+    NAO altera, repara, fecha ou guarda documentos.
+
+.REQUIREMENTS
+    Windows PowerShell 5.1+
+    Microsoft Excel instalado e aberto
+#>
+
+$ErrorActionPreference = "Continue"
+
+# ============================================================
+# CONFIGURACAO
+# ============================================================
+
+$BaseDir = "C:\ProgramData\ExcelExpert"
+$ReportDir = Join-Path $BaseDir "Reports"
+
+$MaxScanCells = 250000
+$MaxBlankRowsReport = 20
+
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+$ReportFile = Join-Path $ReportDir "ExcelExpert_$Timestamp.txt"
+$CsvFile = Join-Path $ReportDir "ExcelExpert_$Timestamp.csv"
+
+$script:Findings = New-Object System.Collections.Generic.List[object]
+$script:WorkbooksAnalysed = 0
+$script:SheetsAnalysed = 0
+$script:InstancesFound = 0
+$script:TotalCells = 0
+$script:FatalErrors = 0
+
+# ============================================================
+# INICIALIZACAO
+# ============================================================
+
+try {
+    New-Item -Path $ReportDir -ItemType Directory -Force |
+        Out-Null
+}
+catch {
+    Write-Host "ERRO: Nao foi possivel criar a pasta de relatorios." -ForegroundColor Red
+    Write-Host $_.Exception.Message
+    exit 1
+}
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Color = "Gray"
+    )
+
+    $Line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message"
+
+    Write-Host $Line -ForegroundColor $Color
+}
+
+function Add-Finding {
+    param(
+        [string]$Workbook,
+        [string]$Sheet,
+        [string]$Cell,
+        [string]$Category,
+        [string]$Severity,
+        [string]$Description
+    )
+
+    $script:Findings.Add([PSCustomObject]@{
+        Workbook    = $Workbook
+        Sheet       = $Sheet
+        Cell        = $Cell
+        Category    = $Category
+        Severity    = $Severity
+        Description = $Description
+        Date        = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    })
+}
+
+# ============================================================
+# DESCOBRIR INSTANCIAS EXCEL ATRAVES DA ROT
+# ============================================================
+
+function Get-ExcelInstances {
+
+    $Applications = @{}
+    $ExcelCLSID = "00024500-0000-0000-C000-000000000046"
+
+    try {
+
+        if (-not ("ExcelExpertRot" -as [type])) {
+
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+
+public static class ExcelExpertRot
+{
+    [DllImport("ole32.dll")]
+    public static extern int GetRunningObjectTable(
+        int reserved,
+        out IRunningObjectTable pprot
+    );
+
+    [DllImport("ole32.dll")]
+    public static extern int CreateBindCtx(
+        int reserved,
+        out IBindCtx ppbc
+    );
+}
+"@
+        }
+
+        $Rot = $null
+        $BindCtx = $null
+
+        $hr = [ExcelExpertRot]::GetRunningObjectTable(
+            0,
+            [ref]$Rot
+        )
+
+        if ($hr -eq 0 -and $Rot) {
+
+            [void][ExcelExpertRot]::CreateBindCtx(
+                0,
+                [ref]$BindCtx
+            )
+
+            $Enumerator = $Rot.EnumRunning()
+
+            $Monikers = New-Object System.Runtime.InteropServices.ComTypes.IMoniker[] 1
+
+            while ($Enumerator.Next(
+                1,
+                $Monikers,
+                [IntPtr]::Zero
+            ) -eq 0) {
+
+                $Moniker = $Monikers[0]
+
+                try {
+
+                    $DisplayName = $Moniker.GetDisplayName(
+                        $BindCtx,
+                        $null
+                    )
+
+                    if ($DisplayName -match $ExcelCLSID) {
+
+                        $Application = $null
+
+                        $Rot.GetObject(
+                            $Moniker,
+                            [ref]$Application
+                        )
+
+                        if ($Application) {
+
+                            try {
+
+                                $Hwnd = [string]$Application.Hwnd
+
+                                if ($Hwnd -and -not $Applications.ContainsKey($Hwnd)) {
+
+                                    $Applications[$Hwnd] = $Application
+                                }
+                            }
+                            catch {}
+                        }
+                    }
+                }
+                catch {}
+            }
+        }
+    }
+    catch {
+        Write-Log "AVISO: Falha na enumeracao ROT: $($_.Exception.Message)" Yellow
+    }
+
+    # Fallback: tentar obter a instancia ativa diretamente.
+
+    if ($Applications.Count -eq 0) {
+
+        try {
+
+            $Application = [Runtime.InteropServices.Marshal]::GetActiveObject(
+                "Excel.Application"
+            )
+
+            if ($Application) {
+
+                $Applications[[string]$Application.Hwnd] = $Application
+            }
+        }
+        catch {}
+    }
+
+    return @($Applications.Values)
+}
+
+# ============================================================
+# ANALISE DE FORMULAS
+# ============================================================
+
+function Test-FormulaErrors {
+
+    param(
+        $Worksheet,
+        [string]$WorkbookName,
+        [string]$SheetName,
+        $UsedRange
+    )
+
+    try {
+
+        # xlCellTypeFormulas = -4123
+        # xlErrors = 16
+
+        $ErrorCells = $UsedRange.SpecialCells(
+            -4123,
+            16
+        )
+
+        foreach ($Cell in $ErrorCells.Cells) {
+
+            $Address = $Cell.Address($false, $false)
+            $DisplayedValue = [string]$Cell.Text
+            $Formula = [string]$Cell.Formula
+
+            $Severity = "ERROR"
+
+            if ($DisplayedValue -match "#REF!") {
+                $Description = "Formula com referencia invalida: $DisplayedValue"
+            }
+            elseif ($DisplayedValue -match "#DIV/0!") {
+                $Description = "Divisao por zero."
+            }
+            elseif ($DisplayedValue -match "#VALUE!") {
+                $Description = "Erro de tipo ou valor na formula."
+            }
+            elseif ($DisplayedValue -match "#NAME\?") {
+                $Description = "Nome ou funcao nao reconhecida."
+            }
+            elseif ($DisplayedValue -match "#N/A") {
+                $Description = "Valor nao disponivel."
+            }
+            elseif ($DisplayedValue -match "#NUM!") {
+                $Description = "Erro numerico."
+            }
+            elseif ($DisplayedValue -match "#NULL!") {
+                $Description = "Intersecao de intervalos invalida."
+            }
+            else {
+                $Description = "Erro de avaliacao: $DisplayedValue"
+            }
+
+            Add-Finding `
+                -Workbook $WorkbookName `
+                -Sheet $SheetName `
+                -Cell $Address `
+                -Category "Formula" `
+                -Severity $Severity `
+                -Description "$Description | $Formula"
+        }
+    }
+    catch {
+        # SpecialCells gera erro quando nao existem celulas com erros.
+    }
+
+    # Procurar referencias #REF! nas formulas.
+
+    try {
+
+        $FormulaCells = $UsedRange.SpecialCells(
+            -4123
+        )
+
+        foreach ($Cell in $FormulaCells.Cells) {
+
+            $Formula = [string]$Cell.Formula
+
+            if ($Formula -match "#REF!") {
+
+                $Address = $Cell.Address($false, $false)
+
+                Add-Finding `
+                    -Workbook $WorkbookName `
+                    -Sheet $SheetName `
+                    -Cell $Address `
+                    -Category "Formula Reference" `
+                    -Severity "CRITICAL" `
+                    -Description "Formula contem referencia #REF!: $Formula"
+            }
+        }
+    }
+    catch {}
+}
+
+# ============================================================
+# ANALISE DE FORMULAS INCONSISTENTES
+# ============================================================
+
+function Test-FormulaConsistency {
+
+    param(
+        [string]$WorkbookName,
+        [string]$SheetName,
+        $UsedRange
+    )
+
+    try {
+
+        $Rows = [int]$UsedRange.Rows.Count
+        $Columns = [int]$UsedRange.Columns.Count
+
+        $Total = $Rows * $Columns
+
+        if ($Total -gt $MaxScanCells) {
+            return
+        }
+
+        $FormulaData = $UsedRange.FormulaR1C1
+
+        if (-not ($FormulaData -is [Array])) {
+            return
+        }
+
+        $RowStart = [int]$UsedRange.Row
+        $ColStart = [int]$UsedRange.Column
+
+        for ($Column = 1; $Column -le $Columns; $Column++) {
+
+            $FormulaMap = @{}
+            $FormulaRows = @()
+
+            for ($Row = 1; $Row -le $Rows; $Row++) {
+
+                $Formula = $FormulaData.GetValue(
+                    $Row,
+                    $Column
+                )
+
+                if ($Formula -is [string] -and $Formula.StartsWith("=")) {
+
+                    if (-not $FormulaMap.ContainsKey($Formula)) {
+                        $FormulaMap[$Formula] = 0
+                    }
+
+                    $FormulaMap[$Formula]++
+
+                    $FormulaRows += [PSCustomObject]@{
+                        Row = $Row
+                        Formula = $Formula
+                    }
+                }
+            }
+
+            if ($FormulaRows.Count -lt 3) {
+                continue
+            }
+
+            $Dominant = $FormulaMap.GetEnumerator() |
+                Sort-Object Value -Descending |
+                Select-Object -First 1
+
+            if (-not $Dominant) {
+                continue
+            }
+
+            $DominantFormula = $Dominant.Key
+            $DominantCount = $Dominant.Value
+
+            # Apenas sinalizar quando existe um padrao dominante
+            # suficientemente consistente.
+
+            if (($DominantCount / $FormulaRows.Count) -lt 0.70) {
+                continue
+            }
+
+            foreach ($Item in $FormulaRows) {
+
+                if ($Item.Formula -ne $DominantFormula) {
+
+                    $ActualRow = $RowStart + $Item.Row - 1
+                    $ActualColumn = $ColStart + $Column - 1
+
+                    try {
+                        $CellAddress = $UsedRange.Worksheet.Cells(
+                            $ActualRow,
+                            $ActualColumn
+                        ).Address($false, $false)
+                    }
+                    catch {
+                        $CellAddress = "Linha $ActualRow / Coluna $ActualColumn"
+                    }
+
+                    Add-Finding `
+                        -Workbook $WorkbookName `
+                        -Sheet $SheetName `
+                        -Cell $CellAddress `
+                        -Category "Formula Consistency" `
+                        -Severity "WARNING" `
+                        -Description "Possivel formula inconsistente. Formula predominante: $DominantFormula | Formula encontrada: $($Item.Formula)"
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log "AVISO: Falha na verificacao de consistencia de formulas: $($_.Exception.Message)" Yellow
+    }
+}
+
+# ============================================================
+# ANALISE DE LINHAS VAZIAS
+# ============================================================
+
+function Test-BlankRows {
+
+    param(
+        [string]$WorkbookName,
+        [string]$SheetName,
+        $UsedRange
+    )
+
+    try {
+
+        $Rows = [int]$UsedRange.Rows.Count
+        $Columns = [int]$UsedRange.Columns.Count
+
+        if (($Rows * $Columns) -gt $MaxScanCells) {
+            return
+        }
+
+        if ($Rows -lt 3 -or $Columns -lt 1) {
+            return
+        }
+
+        $Data = $UsedRange.Value2
+
+        if (-not ($Data -is [Array])) {
+            return
+        }
+
+        $BlankCount = 0
+
+        for ($Row = 1; $Row -le $Rows; $Row++) {
+
+            $IsBlank = $true
+
+            for ($Column = 1; $Column -le $Columns; $Column++) {
+
+                $Value = $Data.GetValue(
+                    $Row,
+                    $Column
+                )
+
+                if ($null -ne $Value -and
+                    -not ($Value -is [string] -and
+                    [string]::IsNullOrWhiteSpace($Value))) {
+
+                    $IsBlank = $false
+                    break
+                }
+            }
+
+            if ($IsBlank) {
+
+                $BlankCount++
+
+                if ($BlankCount -le $MaxBlankRows) {
+
+                    $ActualRow = [int]$UsedRange.Row + $Row - 1
+
+                    Add-Finding `
+                        -Workbook $WorkbookName `
+                        -Sheet $SheetName `
+                        -Cell "Linha $ActualRow" `
+                        -Category "Blank Row" `
+                        -Severity "INFO" `
+                        -Description "Linha completamente vazia dentro do UsedRange."
+                }
+            }
+        }
+
+        if ($BlankCount -gt $MaxBlankRows) {
+
+            Add-Finding `
+                -Workbook $WorkbookName `
+                -Sheet $SheetName `
+                -Cell "" `
+                -Category "Blank Rows" `
+                -Severity "INFO" `
+                -Description "$BlankCount linhas vazias encontradas. Apenas as primeiras $MaxBlankRows foram detalhadas."
+        }
+    }
+    catch {
+        Write-Log "AVISO: Nao foi possivel analisar linhas vazias: $($_.Exception.Message)" Yellow
+    }
+}
+
+# ============================================================
+# ANALISE DE CADA FOLHA
+# ============================================================
+
+function Analyze-Worksheet {
+
+    param(
+        $Worksheet,
+        [string]$WorkbookName
+    )
+
+    $SheetName = [string]$Worksheet.Name
+
+    $script:SheetsAnalysed++
+
+    Write-Log "  A analisar folha: $SheetName" Cyan
+
+    try {
+
+        $Visibility = [int]$Worksheet.Visible
+
+        if ($Visibility -eq 0) {
+
+            Add-Finding `
+                -Workbook $WorkbookName `
+                -Sheet $SheetName `
+                -Cell "" `
+                -Category "Worksheet Visibility" `
+                -Severity "INFO" `
+                -Description "Folha oculta."
+        }
+        elseif ($Visibility -eq 2) {
+
+            Add-Finding `
+                -Workbook $WorkbookName `
+                -Sheet $SheetName `
+                -Cell "" `
+                -Category "Worksheet Visibility" `
+                -Severity "INFO" `
+                -Description "Folha muito oculta (VeryHidden)."
+        }
+
+        $UsedRange = $Worksheet.UsedRange
+
+        if (-not $UsedRange) {
+            return
+        }
+
+        $Rows = [int]$UsedRange.Rows.Count
+        $Columns = [int]$UsedRange.Columns.Count
+
+        $CellCount = $Rows * $Columns
+
+        $script:TotalCells += $CellCount
+
+        Write-Log "    UsedRange: $($UsedRange.Address()) | $CellCount celulas" Gray
+
+        if ($CellCount -gt $MaxScanCells) {
+
+            Add-Finding `
+                -Workbook $WorkbookName `
+                -Sheet $SheetName `
+                -Cell "" `
+                -Category "Large UsedRange" `
+                -Severity "WARNING" `
+                -Description "UsedRange possui $CellCount celulas. Analises em massa limitadas a $MaxScanCells celulas."
+        }
+
+        # Erros de formulas e referencias.
+
+        Test-FormulaErrors `
+            -Worksheet $Worksheet `
+            -WorkbookName $WorkbookName `
+            -SheetName $SheetName `
+            -UsedRange $UsedRange
+
+        # Consistencia das formulas.
+
+        Test-FormulaConsistency `
+            -WorkbookName $WorkbookName `
+            -SheetName $SheetName `
+            -UsedRange $UsedRange
+
+        # Linhas vazias.
+
+        Test-BlankRows `
+            -WorkbookName $WorkbookName `
+            -SheetName $SheetName `
+            -UsedRange $UsedRange
+
+        # Celulas mescladas.
+
+        try {
+
+            $Merged = $UsedRange.MergeCells
+
+            if ($Merged -eq $true) {
+
+                Add-Finding `
+                    -Workbook $WorkbookName `
+                    -Sheet $SheetName `
+                    -Cell "" `
+                    -Category "Merged Cells" `
+                    -Severity "INFO" `
+                    -Description "Existem celulas mescladas no UsedRange."
+            }
+        }
+        catch {}
+
+        # Tabelas Excel.
+
+        try {
+
+            $TableCount = [int]$Worksheet.ListObjects.Count
+
+            if ($TableCount -gt 0) {
+
+                for ($i = 1; $i -le $TableCount; $i++) {
+
+                    $Table = $Worksheet.ListObjects.Item($i)
+
+                    Add-Finding `
+                        -Workbook $WorkbookName `
+                        -Sheet $SheetName `
+                        -Cell "" `
+                        -Category "Excel Table" `
+                        -Severity "INFO" `
+                        -Description "Tabela identificada: $($Table.Name) | Linhas: $($Table.ListRows.Count)"
+                }
+            }
+        }
+        catch {}
+
+    }
+    catch {
+
+        Add-Finding `
+            -Workbook $WorkbookName `
+            -Sheet $SheetName `
+            -Cell "" `
+            -Category "Worksheet Analysis" `
+            -Severity "ERROR" `
+            -Description $_.Exception.Message
+
+        Write-Log "    ERRO na folha: $SheetName" Red
+    }
+}
+
+# ============================================================
+# ANALISE DE NOMES DEFINIDOS
+# ============================================================
+
+function Test-DefinedNames {
+
+    param(
+        $Workbook,
+        [string]$WorkbookName
+    )
+
+    try {
+
+        for ($i = 1; $i -le $Workbook.Names.Count; $i++) {
+
+            $DefinedName = $Workbook.Names.Item($i)
+
+            $Name = [string]$DefinedName.Name
+            $RefersTo = [string]$DefinedName.RefersTo
+
+            if ($RefersTo -match "#REF!") {
+
+                Add-Finding `
+                    -Workbook $WorkbookName `
+                    -Sheet "" `
+                    -Cell $Name `
+                    -Category "Defined Name" `
+                    -Severity "CRITICAL" `
+                    -Description "Nome definido com referencia invalida: $RefersTo"
+            }
+        }
+    }
+    catch {
+
+        Write-Log "AVISO: Falha na verificacao de nomes definidos." Yellow
+    }
+}
+
+# ============================================================
+# ANALISE DE LIGACOES EXTERNAS
+# ============================================================
+
+function Test-ExternalLinks {
+
+    param(
+        $Workbook,
+        [string]$WorkbookName
+    )
+
+    try {
+
+        # xlExcelLinks = 1
+
+        $Links = $Workbook.LinkSources(1)
+
+        if ($null -ne $Links) {
+
+            foreach ($Link in $Links) {
+
+                Add-Finding `
+                    -Workbook $WorkbookName `
+                    -Sheet "" `
+                    -Cell "" `
+                    -Category "External Link" `
+                    -Severity "INFO" `
+                    -Description "Ligacao externa identificada: $Link"
+            }
+        }
+    }
+    catch {}
+}
+
+# ============================================================
+# ANALISE DE CADA LIVRO
+# ============================================================
+
+function Analyze-Workbook {
+
+    param(
+        $Workbook
+    )
+
+    $WorkbookName = [string]$Workbook.Name
+
+    Write-Log "----------------------------------------------------" DarkGray
+    Write-Log "LIVRO: $WorkbookName" Green
+
+    try {
+
+        $FullName = [string]$Workbook.FullName
+
+        Write-Log "Caminho: $FullName" Gray
+
+        Add-Finding `
+            -Workbook $WorkbookName `
+            -Sheet "" `
+            -Cell "" `
+            -Category "Workbook Information" `
+            -Severity "INFO" `
+            -Description "Ficheiro analisado: $FullName"
+
+        if ($Workbook.ReadOnly) {
+
+            Add-Finding `
+                -Workbook $WorkbookName `
+                -Sheet "" `
+                -Cell "" `
+                -Category "Workbook Status" `
+                -Severity "INFO" `
+                -Description "Livro aberto em modo apenas de leitura."
+        }
+
+        if ($Workbook.Saved -eq $false) {
+
+            Add-Finding `
+                -Workbook $WorkbookName `
+                -Sheet "" `
+                -Cell "" `
+                -Category "Workbook Status" `
+                -Severity "INFO" `
+                -Description "O livro possui alteracoes por guardar. O script nao as guarda."
+        }
+
+        # Ligacoes externas.
+
+        Test-ExternalLinks `
+            -Workbook $Workbook `
+            -WorkbookName $WorkbookName
+
+        # Nomes definidos.
+
+        Test-DefinedNames `
+            -Workbook $Workbook `
+            -WorkbookName $WorkbookName
+
+        # Folhas.
+
+        $SheetCount = [int]$Workbook.Worksheets.Count
+
+        for ($i = 1; $i -le $SheetCount; $i++) {
+
+            try {
+
+                $Worksheet = $Workbook.Worksheets.Item($i)
+
+                Analyze-Worksheet `
+                    -Worksheet $Worksheet `
+                    -WorkbookName $WorkbookName
+            }
+            catch {
+
+                Write-Log "ERRO ao aceder a folha $i : $($_.Exception.Message)" Red
+            }
+        }
+
+        $script:WorkbooksAnalysed++
+
+    }
+    catch {
+
+        $script:FatalErrors++
+
+        Write-Log "ERRO ao analisar livro: $($_.Exception.Message)" Red
+    }
+}
+
+# ============================================================
+# EXECUCAO PRINCIPAL
+# ============================================================
+
+Clear-Host
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "              EXCEL EXPERT DIAGNOSTIC" -ForegroundColor Cyan
+Write-Host "                    FULL AUDIT" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Log "Inicio do diagnostico." Green
+Write-Log "Modo: READ ONLY / DIAGNOSTIC" Green
+Write-Log "Computador: $env:COMPUTERNAME" Gray
+Write-Log "Utilizador: $env:USERNAME" Gray
+Write-Log "PowerShell: $($PSVersionTable.PSVersion)" Gray
+
+# Descobrir instancias Excel.
+
+Write-Log "A procurar instancias Excel abertas..." Cyan
+
+$ExcelInstances = @(Get-ExcelInstances)
+
+$script:InstancesFound = $ExcelInstances.Count
+
+if ($ExcelInstances.Count -eq 0) {
+
+    Write-Log "Nenhuma instancia Excel acessivel encontrada." Red
+
+    Write-Host ""
+    Write-Host "Abre o Microsoft Excel e executa novamente o script." -ForegroundColor Yellow
+
+    exit 2
+}
+
+Write-Log "Instancias Excel encontradas: $($ExcelInstances.Count)" Green
+
+# Percorrer instancias e respetivos livros.
+
+foreach ($Application in $ExcelInstances) {
+
+    try {
+
+        Write-Log "A analisar instancia Excel PID/HWND: $($Application.Hwnd)" Cyan
+
+        $WorkbookCount = [int]$Application.Workbooks.Count
+
+        if ($WorkbookCount -eq 0) {
+
+            Write-Log "Esta instancia nao possui livros abertos." Yellow
+            continue
+        }
+
+        for ($i = 1; $i -le $WorkbookCount; $i++) {
+
+            try {
+
+                $Workbook = $Application.Workbooks.Item($i)
+
+                Analyze-Workbook -Workbook $Workbook
+            }
+            catch {
+
+                $script:FatalErrors++
+
+                Write-Log "Erro ao aceder ao livro $i : $($_.Exception.Message)" Red
+            }
+        }
+    }
+    catch {
+
+        $script:FatalErrors++
+
+        Write-Log "Erro na instancia Excel: $($_.Exception.Message)" Red
+    }
+}
+
+# ============================================================
+# RELATORIO FINAL
+# ============================================================
+
+$ErrorCount = @(
+    $script:Findings | Where-Object {
+        $_.Severity -eq "ERROR" -or $_.Severity -eq "CRITICAL"
+    }
+).Count
+
+$WarningCount = @(
+    $script:Findings | Where-Object {
+        $_.Severity -eq "WARNING"
+    }
+).Count
+
+$InfoCount = @(
+    $script:Findings | Where-Object {
+        $_.Severity -eq "INFO"
+    }
+).Count
+
+$Report = @()
+
+$Report += "============================================================"
+$Report += "             EXCEL EXPERT DIAGNOSTIC"
+$Report += "                    FULL AUDIT"
+$Report += "============================================================"
+$Report += ""
+$Report += "Data: $(Get-Date)"
+$Report += "Computador: $env:COMPUTERNAME"
+$Report += "Utilizador: $env:USERNAME"
+$Report += ""
+$Report += "INSTANCIAS EXCEL: $script:InstancesFound"
+$Report += "LIVROS ANALISADOS: $script:WorkbooksAnalysed"
+$Report += "FOLHAS ANALISADAS: $script:SheetsAnalysed"
+$Report += "CELULAS NO USED RANGE: $script:TotalCells"
+$Report += ""
+$Report += "ERROS / CRITICOS: $ErrorCount"
+$Report += "AVISOS: $WarningCount"
+$Report += "INFORMACOES: $InfoCount"
+$Report += "FALHAS DE ANALISE: $script:FatalErrors"
+$Report += ""
+$Report += "============================================================"
+$Report += "                DETALHES DA ANALISE"
+$Report += "============================================================"
+$Report += ""
+
+foreach ($Finding in $script:Findings) {
+
+    $Report += "------------------------------------------------------------"
+    $Report += "Ficheiro: $($Finding.Workbook)"
+    $Report += "Folha: $($Finding.Sheet)"
+    $Report += "Celula: $($Finding.Cell)"
+    $Report += "Categoria: $($Finding.Category)"
+    $Report += "Severidade: $($Finding.Severity)"
+    $Report += "Descricao: $($Finding.Description)"
+    $Report += ""
+}
+
+$Report += "============================================================"
+$Report += "FIM DO DIAGNOSTICO"
+$Report += "============================================================"
+
+try {
+
+    $Report | Out-File `
+        -FilePath $ReportFile `
+        -Encoding UTF8 `
+        -Force
+
+    if ($script:Findings.Count -gt 0) {
+
+        $script:Findings |
+            Export-Csv `
+                -Path $CsvFile `
+                -NoTypeInformation `
+                -Encoding UTF8 `
+                -Delimiter ";"
+    }
+
+}
+catch {
+
+    Write-Log "ERRO ao guardar relatorios: $($_.Exception.Message)" Red
+    exit 1
+}
+
+# ============================================================
+# RESUMO NO ECRA
+# ============================================================
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "                 RESULTADO DO DIAGNOSTICO" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+Write-Host "Instancias Excel: $script:InstancesFound" -ForegroundColor Gray
+Write-Host "Livros analisados: $script:WorkbooksAnalysed" -ForegroundColor Gray
+Write-Host "Folhas analisadas: $script:SheetsAnalysed" -ForegroundColor Gray
+Write-Host "Celulas no UsedRange: $script:TotalCells" -ForegroundColor Gray
+
+Write-Host ""
+
+Write-Host "Erros/criticos: $ErrorCount" -ForegroundColor Red
+Write-Host "Avisos: $WarningCount" -ForegroundColor Yellow
+Write-Host "Informacoes: $InfoCount" -ForegroundColor Cyan
+Write-Host "Falhas de analise: $script:FatalErrors" -ForegroundColor Magenta
+
+Write-Host ""
+Write-Host "Relatorio TXT: $ReportFile" -ForegroundColor Green
+Write-Host "Relatorio CSV: $CsvFile" -ForegroundColor Green
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "Diagnostico concluido. Nenhum documento foi alterado." -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Cyan
+
+Write-Host ""
+Read-Host "Pressiona ENTER para terminar"
+
+exit 0
